@@ -200,7 +200,7 @@ for col, cfg in input_config.items():
 # =============================================================================
 # PREDICTION
 # =============================================================================
-if st.sidebar.button("🚀 Predict Match", type="primary", use_container_width=True):
+if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
     # Build raw input DataFrame
     input_data = {
         'HomeTeam': home_team,
@@ -267,7 +267,7 @@ if st.sidebar.button("🚀 Predict Match", type="primary", use_container_width=T
                         probs_dict[f"{away_team} Win"] = outcome_probs[i]
                 
                 probs_series = pd.Series(probs_dict)
-                st.bar_chart(probs_series, use_container_width=True)
+                st.bar_chart(probs_series, width="stretch")
                 max_conf = max(outcome_probs)
                 st.success(f"**Confidence:** {max_conf:.1%}")
             else:
