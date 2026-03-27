@@ -3,10 +3,12 @@ import pandas as pd
 import numpy as np
 import joblib
 import os
+import warnings
 from sklearn.preprocessing import LabelEncoder
 from scipy.special import softmax
-import warnings
 
+# Suppress scikit-learn version mismatch warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 warnings.filterwarnings("ignore", message="Mean of empty slice")
 
 # =============================================================================
@@ -22,20 +24,20 @@ CLUSTER_SCALER_FILENAME = os.path.join(BASE_DIR, 'cluster_robust_scaler.joblib')
 CLUSTER_KMEANS_FILENAME = os.path.join(BASE_DIR, 'cluster_kmeans_model.joblib')
 
 # =============================================================================
-# RESOURCE LOADING (cached)
+# RESOURCE LOADING
 # =============================================================================
 @st.cache_resource
 def load_resources():
     try:
         outcome_model = joblib.load(OUTCOME_MODEL_FILENAME)
         goals_model = joblib.load(GOALS_MODEL_FILENAME)
-       
+        
         try:
             label_encoder = joblib.load(LABEL_ENCODER_FILENAME)
         except FileNotFoundError:
             label_encoder = LabelEncoder()
             label_encoder.fit(['A', 'D', 'H'])
-       
+        
         return outcome_model, goals_model, label_encoder
     except Exception as e:
         st.error(f"❌ Failed to load main models: {e}")
@@ -110,7 +112,7 @@ def compute_cluster_features(row):
 
 
 def get_cluster_probabilities(row):
-    """Return dictionary with C_LTH, C_LTA, C_VHD, C_VAD, C_HTB, C_PHB"""
+    """Return dictionary with C_LTH ... C_PHB"""
     if cluster_scaler is None or kmeans_model is None:
         return {'C_LTH': 0.0, 'C_LTA': 0.0, 'C_VHD': 0.0,
                 'C_VAD': 0.0, 'C_HTB': 0.0, 'C_PHB': 0.0}
@@ -119,7 +121,6 @@ def get_cluster_probabilities(row):
         X = compute_cluster_features(row)
         X_scaled = cluster_scaler.transform(X)
         
-        # Get softmax probabilities from distances to centroids
         distances = np.linalg.norm(X_scaled[:, np.newaxis] - kmeans_model.cluster_centers_, axis=2)
         probas = softmax(-distances, axis=1)[0]
 
@@ -195,12 +196,12 @@ if outcome_model is None or goals_model is None:
     st.error("❌ Models could not be loaded.")
     st.info("**Troubleshooting tips:**")
     st.info("1. Make sure all .joblib files are in the root of your repository")
-    st.info("2. Files needed:")
-    st.info("   - Gradient_Boosting_Classifier_outcome_model.joblib")
-    st.info("   - XGBoost_Regressor_goals_model.joblib")
-    st.info("   - label_encoder.joblib")
-    st.info("   - cluster_robust_scaler.joblib")
-    st.info("   - cluster_kmeans_model.joblib")
+    st.info("2. Required files:")
+    st.info("   • Gradient_Boosting_Classifier_outcome_model.joblib")
+    st.info("   • XGBoost_Regressor_goals_model.joblib")
+    st.info("   • label_encoder.joblib")
+    st.info("   • cluster_robust_scaler.joblib")
+    st.info("   • cluster_kmeans_model.joblib")
     st.stop()
 
 # =============================================================================
@@ -307,7 +308,7 @@ if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
         # Show computed cluster probabilities
         st.caption("Computed Cluster Probabilities (used by the model):")
         cluster_values = processed_features[['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']].iloc[0]
-        st.dataframe(cluster_values.rename("Probability"), use_container_width=True)
+        st.dataframe(cluster_values.rename("Probability"), width="stretch")
      
         st.caption("Model used: Gradient Boosting (outcome) + XGBoost (goals) with auto-computed clusters")
      
