@@ -2,22 +2,24 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import os
 from sklearn.preprocessing import LabelEncoder
 from scipy.special import softmax
-import os
 import warnings
 
 warnings.filterwarnings("ignore", message="Mean of empty slice")
 
 # =============================================================================
-# CONSTANTS
+# CONSTANTS - Use absolute paths relative to script location
 # =============================================================================
-OUTCOME_MODEL_FILENAME = 'Gradient_Boosting_Classifier_outcome_model.joblib'
-GOALS_MODEL_FILENAME = 'XGBoost_Regressor_goals_model.joblib'
-LABEL_ENCODER_FILENAME = 'label_encoder.joblib'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
 
-CLUSTER_SCALER_FILENAME = 'cluster_robust_scaler.joblib'
-CLUSTER_KMEANS_FILENAME = 'cluster_kmeans_model.joblib'
+OUTCOME_MODEL_FILENAME = os.path.join(BASE_DIR, 'Gradient_Boosting_Classifier_outcome_model.joblib')
+GOALS_MODEL_FILENAME = os.path.join(BASE_DIR, 'XGBoost_Regressor_goals_model.joblib')
+LABEL_ENCODER_FILENAME = os.path.join(BASE_DIR, 'label_encoder.joblib')
+
+CLUSTER_SCALER_FILENAME = os.path.join(BASE_DIR, 'cluster_robust_scaler.joblib')
+CLUSTER_KMEANS_FILENAME = os.path.join(BASE_DIR, 'cluster_kmeans_model.joblib')
 
 # =============================================================================
 # RESOURCE LOADING (cached)
@@ -27,17 +29,17 @@ def load_resources():
     try:
         outcome_model = joblib.load(OUTCOME_MODEL_FILENAME)
         goals_model = joblib.load(GOALS_MODEL_FILENAME)
-      
-        # Try to load the exact encoder used during training
+        
         try:
             label_encoder = joblib.load(LABEL_ENCODER_FILENAME)
         except FileNotFoundError:
             label_encoder = LabelEncoder()
             label_encoder.fit(['A', 'D', 'H'])
-      
+        
         return outcome_model, goals_model, label_encoder
-    except FileNotFoundError as e:
-        st.error(f"❌ Model file not found: {e}")
+    except Exception as e:
+        st.error(f"❌ Failed to load main models: {e}")
+        st.info(f"Looking for files in: {BASE_DIR}")
         return None, None, None
 
 
@@ -53,14 +55,15 @@ def load_cluster_models():
             st.error(f"❌ Error loading cluster models: {e}")
             return None, None
     else:
-        st.error("❌ Cluster models not found in the current folder.")
-        st.info("💡 Make sure `cluster_robust_scaler.joblib` and `cluster_kmeans_model.joblib` "
-                "are uploaded to your repository and placed in the same directory as `model.py`.")
-        st.info("You can download them from your notebook after running the fitting step.")
+        st.error("❌ Cluster models not found.")
+        st.info("Please ensure these files are in the repository root:")
+        st.info("• cluster_robust_scaler.joblib")
+        st.info("• cluster_kmeans_model.joblib")
+        st.info(f"Current directory: {BASE_DIR}")
         return None, None
 
 
-# Load models once
+# Load models
 outcome_model, goals_model, label_encoder = load_resources()
 cluster_scaler, kmeans_model = load_cluster_models()
 
@@ -84,7 +87,7 @@ base_columns = [
 ]
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (unchanged from your last version)
 # =============================================================================
 def clean_input_data(df):
     df = df.replace([np.inf, -np.inf], np.nan)
@@ -95,7 +98,6 @@ def clean_input_data(df):
 
 
 def compute_cluster_features(row):
-    """Compute the 5 input features needed for clustering"""
     home_shots = row['HomeShots']
     away_shots = row['AwayShots']
     home_target = row['HomeTarget']
@@ -103,39 +105,28 @@ def compute_cluster_features(row):
     home_elo = row['HomeElo']
     away_elo = row['AwayElo']
 
-    # Shot efficiency differential
     home_eff = home_target / (home_shots + 0.1)
     away_eff = away_target / (away_shots + 0.1)
     shot_eff_diff = home_eff - away_eff
 
-    # Possession dominance proxy
     total_attacks = home_shots + away_shots + 0.1
     possession_dom = (home_shots + home_target * 1.2 - (away_shots + away_target * 1.2)) / total_attacks
 
-    # Physicality proxy
     physicality = (home_shots + away_shots) * 1.1
-
-    # Tempo (total shots)
     tempo = home_shots + away_shots
-
-    # Elo differential
     elo_diff = home_elo - away_elo
 
-    return pd.DataFrame([[
-        shot_eff_diff, possession_dom, physicality, tempo, elo_diff
-    ]], columns=['shot_eff_diff', 'possession_dom', 'physicality', 'tempo', 'elo_diff'])
+    return pd.DataFrame([[shot_eff_diff, possession_dom, physicality, tempo, elo_diff]],
+                        columns=['shot_eff_diff', 'possession_dom', 'physicality', 'tempo', 'elo_diff'])
 
 
 def get_cluster_probabilities(row):
-    """Return dictionary with C_LTH, C_LTA, C_VHD, C_VAD, C_HTB, C_PHB"""
     if cluster_scaler is None or kmeans_model is None:
         return {'C_LTH': 0.0, 'C_LTA': 0.0, 'C_VHD': 0.0,
                 'C_VAD': 0.0, 'C_HTB': 0.0, 'C_PHB': 0.0}
 
     X = compute_cluster_features(row)
     X_scaled = cluster_scaler.transform(X)
-
-    # Get softmax probabilities from distances to centroids
     distances = np.linalg.norm(X_scaled[:, np.newaxis] - kmeans_model.cluster_centers_, axis=2)
     probas = softmax(-distances, axis=1)[0]
 
@@ -145,39 +136,26 @@ def get_cluster_probabilities(row):
 
 def create_input_features(df):
     df = df.copy()
-  
-    # Elo features
     df['EloDiff'] = df['HomeElo'] - df['AwayElo']
     df['EloSum'] = df['HomeElo'] + df['AwayElo']
-  
-    # Form ratios
     df['Form3Ratio'] = df['Form3Home'] / (df['Form3Away'] + 0.1)
     df['Form5Ratio'] = df['Form5Home'] / (df['Form5Away'] + 0.1)
-  
-    # Probabilities from odds
     df['HomeWinProbability'] = np.where(df['OddHome'] > 0, 1 / df['OddHome'], 0.5)
     df['DrawProbability'] = np.where(df['OddDraw'] > 0, 1 / df['OddDraw'], 0.25)
     df['AwayWinProbability'] = np.where(df['OddAway'] > 0, 1 / df['OddAway'], 0.25)
-  
-    # Shot efficiency
     df['HomeShotEfficiency'] = df['HomeTarget'] / (df['HomeShots'] + 0.1)
     df['AwayShotEfficiency'] = df['AwayTarget'] / (df['AwayShots'] + 0.1)
-  
-    # Attack strength
     df['HomeAttackStrength'] = df['HomeExpectedGoals'] * df['Form5Home'] / 15
     df['AwayAttackStrength'] = df['AwayExpectedGoals'] * df['Form5Away'] / 15
-  
     return df
 
 
 def preprocess_input_data(input_df, feature_columns):
     defaults = {
-        'HomeShots': 12.0, 'AwayShots': 10.0,
-        'HomeTarget': 4.0, 'AwayTarget': 3.0,
+        'HomeShots': 12.0, 'AwayShots': 10.0, 'HomeTarget': 4.0, 'AwayTarget': 3.0,
         'OddHome': 2.0, 'OddDraw': 3.0, 'OddAway': 3.0,
         'HomeExpectedGoals': 1.5, 'AwayExpectedGoals': 1.2,
-        'Form3Home': 0, 'Form5Home': 0,
-        'Form3Away': 0, 'Form5Away': 0,
+        'Form3Home': 0, 'Form5Home': 0, 'Form3Away': 0, 'Form5Away': 0,
         'HandiSize': 0.0, 'Over25': 2.0, 'Under25': 2.0,
     }
   
@@ -188,12 +166,11 @@ def preprocess_input_data(input_df, feature_columns):
     cleaned_df = clean_input_data(input_df)
     featured_df = create_input_features(cleaned_df)
   
-    # === COMPUTE CLUSTERS AUTOMATICALLY ===
+    # Compute clusters automatically
     cluster_dict = get_cluster_probabilities(featured_df.iloc[0])
     for col, val in cluster_dict.items():
         featured_df[col] = val
   
-    # Final safety net
     missing = [col for col in feature_columns if col not in featured_df.columns]
     if missing:
         st.warning(f"⚠️ Missing features: {missing}. Using 0 as fallback.")
@@ -210,7 +187,6 @@ def preprocess_input_data(input_df, feature_columns):
 st.title("⚽ Football Match Predictor")
 st.markdown("Predict match outcome, total goals, and probabilities using Gradient Boosting + XGBoost models.")
 
-# Team names
 col_team1, col_team2 = st.columns(2)
 with col_team1:
     home_team = st.text_input("Home Team", "Team A")
@@ -218,14 +194,19 @@ with col_team2:
     away_team = st.text_input("Away Team", "Team B")
 
 if outcome_model is None or goals_model is None:
-    st.error("❌ Models could not be loaded. Please check that the .joblib files are in the same folder.")
+    st.error("❌ Models could not be loaded.")
+    st.info("**Troubleshooting tips:**")
+    st.info("1. Make sure all .joblib files are in the root of your repository")
+    st.info("2. Files needed:")
+    st.info("   - Gradient_Boosting_Classifier_outcome_model.joblib")
+    st.info("   - XGBoost_Regressor_goals_model.joblib")
+    st.info("   - label_encoder.joblib")
+    st.info("   - cluster_robust_scaler.joblib")
+    st.info("   - cluster_kmeans_model.joblib")
     st.stop()
 
-# =============================================================================
-# SIDEBAR INPUTS (clusters removed – now auto-computed)
-# =============================================================================
+# Sidebar inputs (same as before)
 st.sidebar.subheader("Match Statistics")
-
 input_config = {
     'HomeElo': {'label': "🏠 Home Elo Rating", 'value': 1500.0, 'step': 1.0},
     'AwayElo': {'label': "🏟️ Away Elo Rating", 'value': 1500.0, 'step': 1.0},
