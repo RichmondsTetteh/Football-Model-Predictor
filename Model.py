@@ -31,13 +31,13 @@ def load_resources():
     try:
         outcome_model = joblib.load(OUTCOME_MODEL_FILENAME)
         goals_model = joblib.load(GOALS_MODEL_FILENAME)
-        
+
         try:
             label_encoder = joblib.load(LABEL_ENCODER_FILENAME)
         except FileNotFoundError:
             label_encoder = LabelEncoder()
             label_encoder.fit(['A', 'D', 'H'])
-        
+
         return outcome_model, goals_model, label_encoder
     except Exception as e:
         st.error(f"❌ Failed to load main models: {e}")
@@ -97,14 +97,18 @@ def clean_input_data(df):
 
 def compute_cluster_features(row):
     """Return EXACT raw columns the scaler was fitted on"""
-    return pd.DataFrame([{
-        'HomeElo':   row.get('HomeElo', 1500.0),
-        'AwayElo':   row.get('AwayElo', 1500.0),
-        'HomeShots': row.get('HomeShots', 12.0),
-        'AwayShots': row.get('AwayShots', 10.0),
-        'HomeTarget': row.get('HomeTarget', 4.0),
-        'AwayTarget': row.get('AwayTarget', 3.0)
-    }])
+    # Ensure the order of features matches the order used during fitting
+    # (HomeShots, AwayShots, HomeTarget, AwayTarget, HomeElo, AwayElo)
+    return pd.DataFrame([
+        {
+            'HomeShots': row.get('HomeShots', 12.0),
+            'AwayShots': row.get('AwayShots', 10.0),
+            'HomeTarget': row.get('HomeTarget', 4.0),
+            'AwayTarget': row.get('AwayTarget', 3.0),
+            'HomeElo': row.get('HomeElo', 1500.0),
+            'AwayElo': row.get('AwayElo', 1500.0)
+        }
+    ])
 
 
 def get_cluster_probabilities(row):
@@ -115,13 +119,13 @@ def get_cluster_probabilities(row):
     try:
         X = compute_cluster_features(row)
         X_scaled = cluster_scaler.transform(X)
-        
+
         distances = np.linalg.norm(X_scaled[:, np.newaxis] - kmeans_model.cluster_centers_, axis=2)
         probas = softmax(-distances, axis=1)[0]
 
         cluster_names = ['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']
         return dict(zip(cluster_names, probas))
-        
+
     except Exception as e:
         st.warning(f"Cluster computation failed: {e}. Using fallback (0.0).")
         return {'C_LTH': 0.0, 'C_LTA': 0.0, 'C_VHD': 0.0,
@@ -152,25 +156,25 @@ def preprocess_input_data(input_df, feature_columns):
         'Form3Home': 0, 'Form5Home': 0, 'Form3Away': 0, 'Form5Away': 0,
         'HandiSize': 0.0, 'Over25': 2.0, 'Under25': 2.0,
     }
- 
+
     for col in base_columns + ['HomeExpectedGoals', 'AwayExpectedGoals']:
         if col not in input_df.columns:
             input_df[col] = defaults.get(col, 0.0)
- 
+
     cleaned_df = clean_input_data(input_df)
     featured_df = create_input_features(cleaned_df)
- 
+
     # Compute clusters automatically
     cluster_dict = get_cluster_probabilities(featured_df.iloc[0])
     for col, val in cluster_dict.items():
         featured_df[col] = val
- 
+
     missing = [col for col in feature_columns if col not in featured_df.columns]
     if missing:
         st.warning(f"⚠️ Missing features: {missing}. Using 0 as fallback.")
         for col in missing:
             featured_df[col] = 0.0
- 
+
     processed_features = featured_df[feature_columns].fillna(0)
     return processed_features
 
