@@ -4,6 +4,7 @@ import numpy as np
 import joblib
 from sklearn.preprocessing import LabelEncoder
 from scipy.special import softmax
+import os
 import warnings
 
 warnings.filterwarnings("ignore", message="Mean of empty slice")
@@ -15,7 +16,6 @@ OUTCOME_MODEL_FILENAME = 'Gradient_Boosting_Classifier_outcome_model.joblib'
 GOALS_MODEL_FILENAME = 'XGBoost_Regressor_goals_model.joblib'
 LABEL_ENCODER_FILENAME = 'label_encoder.joblib'
 
-# Cluster model files (download these from the official GitHub repo)
 CLUSTER_SCALER_FILENAME = 'cluster_robust_scaler.joblib'
 CLUSTER_KMEANS_FILENAME = 'cluster_kmeans_model.joblib'
 
@@ -27,30 +27,36 @@ def load_resources():
     try:
         outcome_model = joblib.load(OUTCOME_MODEL_FILENAME)
         goals_model = joblib.load(GOALS_MODEL_FILENAME)
-       
+      
         # Try to load the exact encoder used during training
         try:
             label_encoder = joblib.load(LABEL_ENCODER_FILENAME)
         except FileNotFoundError:
             label_encoder = LabelEncoder()
             label_encoder.fit(['A', 'D', 'H'])
-       
+      
         return outcome_model, goals_model, label_encoder
     except FileNotFoundError as e:
         st.error(f"❌ Model file not found: {e}")
         return None, None, None
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading cluster models...")
 def load_cluster_models():
-    try:
-        scaler = joblib.load(CLUSTER_SCALER_FILENAME)
-        kmeans = joblib.load(CLUSTER_KMEANS_FILENAME)
-        return scaler, kmeans
-    except FileNotFoundError:
-        st.warning("⚠️ Cluster models not found. Using fallback (all probabilities = 0). "
-                   "Please download 'cluster_robust_scaler.joblib' and 'cluster_kmeans_model.joblib' "
-                   "from https://github.com/xgabora/Club-Football-Match-Data-2000-2025")
+    if os.path.exists(CLUSTER_SCALER_FILENAME) and os.path.exists(CLUSTER_KMEANS_FILENAME):
+        try:
+            scaler = joblib.load(CLUSTER_SCALER_FILENAME)
+            kmeans = joblib.load(CLUSTER_KMEANS_FILENAME)
+            st.success("✅ Cluster models loaded successfully!")
+            return scaler, kmeans
+        except Exception as e:
+            st.error(f"❌ Error loading cluster models: {e}")
+            return None, None
+    else:
+        st.error("❌ Cluster models not found in the current folder.")
+        st.info("💡 Make sure `cluster_robust_scaler.joblib` and `cluster_kmeans_model.joblib` "
+                "are uploaded to your repository and placed in the same directory as `model.py`.")
+        st.info("You can download them from your notebook after running the fitting step.")
         return None, None
 
 
@@ -102,12 +108,12 @@ def compute_cluster_features(row):
     away_eff = away_target / (away_shots + 0.1)
     shot_eff_diff = home_eff - away_eff
 
-    # Possession dominance proxy (based on shots + targets)
+    # Possession dominance proxy
     total_attacks = home_shots + away_shots + 0.1
     possession_dom = (home_shots + home_target * 1.2 - (away_shots + away_target * 1.2)) / total_attacks
 
-    # Physicality (we don't have fouls, so use a reasonable proxy based on available data)
-    physicality = (home_shots + away_shots) * 1.1   # approximate
+    # Physicality proxy
+    physicality = (home_shots + away_shots) * 1.1
 
     # Tempo (total shots)
     tempo = home_shots + away_shots
@@ -139,28 +145,28 @@ def get_cluster_probabilities(row):
 
 def create_input_features(df):
     df = df.copy()
-   
+  
     # Elo features
     df['EloDiff'] = df['HomeElo'] - df['AwayElo']
     df['EloSum'] = df['HomeElo'] + df['AwayElo']
-   
+  
     # Form ratios
     df['Form3Ratio'] = df['Form3Home'] / (df['Form3Away'] + 0.1)
     df['Form5Ratio'] = df['Form5Home'] / (df['Form5Away'] + 0.1)
-   
+  
     # Probabilities from odds
     df['HomeWinProbability'] = np.where(df['OddHome'] > 0, 1 / df['OddHome'], 0.5)
     df['DrawProbability'] = np.where(df['OddDraw'] > 0, 1 / df['OddDraw'], 0.25)
     df['AwayWinProbability'] = np.where(df['OddAway'] > 0, 1 / df['OddAway'], 0.25)
-   
+  
     # Shot efficiency
     df['HomeShotEfficiency'] = df['HomeTarget'] / (df['HomeShots'] + 0.1)
     df['AwayShotEfficiency'] = df['AwayTarget'] / (df['AwayShots'] + 0.1)
-   
+  
     # Attack strength
     df['HomeAttackStrength'] = df['HomeExpectedGoals'] * df['Form5Home'] / 15
     df['AwayAttackStrength'] = df['AwayExpectedGoals'] * df['Form5Away'] / 15
-   
+  
     return df
 
 
@@ -174,28 +180,29 @@ def preprocess_input_data(input_df, feature_columns):
         'Form3Away': 0, 'Form5Away': 0,
         'HandiSize': 0.0, 'Over25': 2.0, 'Under25': 2.0,
     }
-   
+  
     for col in base_columns + ['HomeExpectedGoals', 'AwayExpectedGoals']:
         if col not in input_df.columns:
             input_df[col] = defaults.get(col, 0.0)
-   
+  
     cleaned_df = clean_input_data(input_df)
     featured_df = create_input_features(cleaned_df)
-   
+  
     # === COMPUTE CLUSTERS AUTOMATICALLY ===
     cluster_dict = get_cluster_probabilities(featured_df.iloc[0])
     for col, val in cluster_dict.items():
         featured_df[col] = val
-   
+  
     # Final safety net
     missing = [col for col in feature_columns if col not in featured_df.columns]
     if missing:
         st.warning(f"⚠️ Missing features: {missing}. Using 0 as fallback.")
         for col in missing:
             featured_df[col] = 0.0
-   
+  
     processed_features = featured_df[feature_columns].fillna(0)
     return processed_features
+
 
 # =============================================================================
 # STREAMLIT APP
@@ -222,24 +229,24 @@ st.sidebar.subheader("Match Statistics")
 input_config = {
     'HomeElo': {'label': "🏠 Home Elo Rating", 'value': 1500.0, 'step': 1.0},
     'AwayElo': {'label': "🏟️ Away Elo Rating", 'value': 1500.0, 'step': 1.0},
-   
+  
     'Form3Home': {'label': "📈 Home Form (last 3)", 'value': 0, 'min': 0, 'max': 9, 'step': 1},
     'Form5Home': {'label': "📈 Home Form (last 5)", 'value': 0, 'min': 0, 'max': 15, 'step': 1},
     'Form3Away': {'label': "📉 Away Form (last 3)", 'value': 0, 'min': 0, 'max': 9, 'step': 1},
     'Form5Away': {'label': "📉 Away Form (last 5)", 'value': 0, 'min': 0, 'max': 15, 'step': 1},
-   
+  
     'HomeShots': {'label': "🔫 Home Shots (expected)", 'value': 12.0, 'min': 0.0, 'max': 30.0, 'step': 1.0},
     'AwayShots': {'label': "🔫 Away Shots (expected)", 'value': 10.0, 'min': 0.0, 'max': 30.0, 'step': 1.0},
     'HomeTarget': {'label': "🎯 Home Shots on Target", 'value': 4.0, 'min': 0.0, 'max': 15.0, 'step': 1.0},
     'AwayTarget': {'label': "🎯 Away Shots on Target", 'value': 3.0, 'min': 0.0, 'max': 15.0, 'step': 1.0},
-   
+  
     'HomeExpectedGoals': {'label': "🏆 Home Expected Goals", 'value': 1.5, 'min': 0.0, 'max': 5.0, 'step': 0.1},
     'AwayExpectedGoals': {'label': "🏆 Away Expected Goals", 'value': 1.2, 'min': 0.0, 'max': 5.0, 'step': 0.1},
-   
+  
     'OddHome': {'label': "💰 Home Win Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
     'OddDraw': {'label': "💰 Draw Odds", 'value': 3.0, 'min': 1.0, 'step': 0.1},
     'OddAway': {'label': "💰 Away Win Odds", 'value': 3.0, 'min': 1.0, 'step': 0.1},
-   
+  
     'HandiSize': {'label': "📏 Handicap Size", 'value': 0.0, 'min': -2.0, 'max': 2.0, 'step': 0.25},
     'Over25': {'label': "📈 Over 2.5 Goals Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
     'Under25': {'label': "📉 Under 2.5 Goals Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
@@ -265,40 +272,40 @@ if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
     }
     input_data.update(feature_input_values)
     input_df_raw = pd.DataFrame([input_data])
-   
+  
     processed_features = preprocess_input_data(input_df_raw, feature_columns)
-   
+  
     if processed_features is not None:
         outcome_encoded = outcome_model.predict(processed_features)[0]
         goals_pred = goals_model.predict(processed_features)[0]
-       
+      
         outcome_probs = None
         if hasattr(outcome_model, 'predict_proba'):
             outcome_probs = outcome_model.predict_proba(processed_features)[0]
-       
+      
         classes = getattr(label_encoder, 'classes_', outcome_model.classes_)
         try:
             predicted_outcome = label_encoder.inverse_transform([outcome_encoded])[0]
         except:
             predicted_outcome = classes[outcome_encoded]
-       
+      
         outcome_display_map = {
             'H': f"🏆 {home_team} Win",
             'D': "🤝 Draw",
             'A': f"🏆 {away_team} Win"
         }
         display_outcome = outcome_display_map.get(predicted_outcome, predicted_outcome)
-       
+      
         st.subheader(f"📊 Prediction: **{home_team}** vs **{away_team}**")
-       
+      
         col1, col2 = st.columns([1, 1.2])
-       
+      
         with col1:
             st.metric("**Predicted Outcome**", display_outcome)
             st.metric("**Total Goals**", f"{round(goals_pred)}")
             over_prob = "Likely **Over 2.5**" if goals_pred > 2.5 else "Likely **Under 2.5**"
             st.metric("**Over/Under 2.5**", over_prob)
-       
+      
         with col2:
             if outcome_probs is not None:
                 probs_dict = {}
@@ -309,19 +316,19 @@ if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
                         probs_dict["Draw"] = outcome_probs[i]
                     elif cls == 'A':
                         probs_dict[f"{away_team} Win"] = outcome_probs[i]
-               
+              
                 probs_series = pd.Series(probs_dict)
                 st.bar_chart(probs_series, width="stretch")
                 max_conf = max(outcome_probs)
                 st.success(f"**Confidence:** {max_conf:.1%}")
-       
-        # Optional: Show computed cluster probabilities
+      
+        # Show computed cluster probabilities
         st.caption("Computed Cluster Probabilities (used by the model):")
         cluster_values = processed_features[['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']].iloc[0]
         st.dataframe(cluster_values.rename("Probability"), use_container_width=True)
-       
+      
         st.caption("Model used: Gradient Boosting (outcome) + XGBoost (goals) with auto-computed clusters")
-       
+      
     else:
         st.error("Preprocessing failed. Please check your inputs.")
 else:
