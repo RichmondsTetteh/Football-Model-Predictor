@@ -34,7 +34,7 @@ if "API_FOOTBALL_KEY" in st.secrets:
     st.info("API Key loaded from Streamlit Secrets.")
 elif os.environ.get("API_FOOTBALL_KEY"):
     API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY")
-    st.info("API Key loaded from environment variable (for local testing).")
+    st.info("API Key loaded from environment variable (for local testing)."
 else:
     API_FOOTBALL_KEY = "YOUR_API_FOOTBALL_KEY_HERE" # Fallback for local testing without env var
     st.warning("⚠️ API_FOOTBALL_KEY not found in Streamlit Secrets or environment variables. Please add it for live data fetching. Using placeholder.")
@@ -201,8 +201,7 @@ def preprocess_input_data(input_df, feature_columns):
 @st.cache_data(ttl=3600) # Cache API responses for 1 hour
 def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: str):
     """
-    Fetches team statistics from an API Football service.
-    YOU NEED TO CUSTOMIZE THIS FUNCTION based on the specific API Football you use.
+    Fetches team statistics from API-Football v3 service.
 
     Args:
         home_team (str): The name of the home team.
@@ -213,53 +212,97 @@ def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: 
         dict: A dictionary containing the fetched statistics, or None if an error occurs.
               The keys should match the input_config keys (e.g., 'Form3Home', 'HomeShots').
     """
-    st.info(f"Attempting to fetch stats for {home_team} vs {away_team}...")
-    # --- REPLACE THIS SECTION WITH YOUR ACTUAL API CALL LOGIC ---
-    # Example using a hypothetical API structure (adjust as needed)
-    # You might need to first resolve team IDs if the API uses them instead of names.
+    st.info(f"Attempting to fetch stats for {home_team} vs {away_team} using API-Football v3...")
+
+    BASE_API_URL = "https://v3.football.api-sports.io/"
+    HEADERS = {
+        'x-rapidapi-key': api_key,
+        'x-rapidapi-host': 'v3.football.api-sports.io'
+    }
+
+    fetched_stats = {}
+
+    # =========================================================================
+    # ⚠️ IMPORTANT: RESOLVING TEAM AND FIXTURE IDs
+    # The /fixtures/statistics endpoint requires 'fixture_id' and 'team_id'.
+    # To make this fully dynamic, you would typically need to perform the
+    # following steps FIRST:
+    # 1. Use the '/teams' endpoint to get 'team_id' from 'home_team' and 'away_team' names.
+    # 2. Use the '/fixtures' endpoint (with team IDs, league, season, date, etc.)
+    #    to find the specific 'fixture_id' for the upcoming match between these teams.
+    # =========================================================================
+
+    # For demonstration, we will use a hardcoded fixture_id and team_ids.
+    # REPLACE THIS LOGIC with dynamic fetching of fixture_id and team_ids!
+    if home_team.lower() == "team a" and away_team.lower() == "team b":
+        st.warning("Using dummy fixture_id and team_ids for 'Team A' vs 'Team B'.")
+        fixture_id_demo = 215662 # Example fixture ID
+        home_team_id_demo = 463 # Example team ID for home
+        away_team_id_demo = 464 # Example team ID for away (assuming another team)
+    elif home_team.lower() == "team c" and away_team.lower() == "team d":
+        st.warning("Using dummy fixture_id and team_ids for 'Team C' vs 'Team D'.")
+        fixture_id_demo = 215663 # Another example fixture ID
+        home_team_id_demo = 465 # Example team ID for home
+        away_team_id_demo = 466 # Example team ID for away
+    else:
+        st.warning(f"Cannot fetch live API data for '{home_team}' vs '{away_team}' without dynamic ID resolution. Using manual inputs.")
+        return None
+
     try:
-        # Example: Replace with your API endpoint and parameters
-        # API_URL = "https://api.football-api.com/v2/teams"
-        # headers = {'X-RapidAPI-Key': api_key, 'X-RapidAPI-Host': 'api-football-v1.p.rapidapi.com'}
-        # params = {'search': home_team} or similar
+        # --- Fetch statistics for the Home Team ---
+        params_home = {"fixture": fixture_id_demo, "team": home_team_id_demo}
+        response_home = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_home)
+        response_home.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        data_home = response_home.json()
 
-        # For demonstration, we'll return dummy data.
-        # In a real scenario, you'd make `requests.get` calls here
-        # and parse the JSON response.
-        # Example: response = requests.get(API_URL, headers=headers, params=params)
-        #          response.raise_for_status() # Raise an exception for HTTP errors
-        #          data = response.json()
+        # --- Fetch statistics for the Away Team ---
+        params_away = {"fixture": fixture_id_demo, "team": away_team_id_demo}
+        response_away = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_away)
+        response_away.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        data_away = response_away.json()
 
-        # Placeholder logic: Simulate API response based on team names
-        if home_team.lower() == "team a" and away_team.lower() == "team b":
-            st.success("Simulated API data fetched for Team A vs Team B!")
-            return {
-                'Form3Home': 7, 'Form5Home': 12,
-                'Form3Away': 5, 'Form5Away': 8,
-                'HomeShots': 15.0, 'AwayShots': 11.0,
-                'HomeTarget': 6.0, 'AwayTarget': 4.0,
-                'HomeExpectedGoals': 1.8, 'AwayExpectedGoals': 1.3
-            }
-        elif home_team.lower() == "team c" and away_team.lower() == "team d":
-             st.success("Simulated API data fetched for Team C vs Team D!")
-             return {
-                'Form3Home': 6, 'Form5Home': 9,
-                'Form3Away': 3, 'Form5Away': 6,
-                'HomeShots': 10.0, 'AwayShots': 14.0,
-                'HomeTarget': 3.0, 'AwayTarget': 5.0,
-                'HomeExpectedGoals': 1.0, 'AwayExpectedGoals': 1.7
-            }
+        # Helper to extract a statistic
+        def get_stat_value(data_response, stat_type):
+            if data_response and data_response['response']:
+                for team_stats in data_response['response']:
+                    if team_stats['team']['id'] == params_home['team'] or team_stats['team']['id'] == params_away['team']:
+                        for stat in team_stats['statistics']:
+                            if stat['type'] == stat_type:
+                                return stat['value'] if stat['value'] is not None else 0
+            return 0
+
+        # Parse Home Team Stats
+        fetched_stats['HomeShots'] = get_stat_value(data_home, "Total Shots")
+        fetched_stats['HomeTarget'] = get_stat_value(data_home, "Shots on Goal")
+
+        # Parse Away Team Stats
+        fetched_stats['AwayShots'] = get_stat_value(data_away, "Total Shots")
+        fetched_stats['AwayTarget'] = get_stat_value(data_away, "Shots on Goal")
+
+        # =====================================================================
+        # ⚠️ MISSING STATISTICS:
+        # 'Form' data (Form3Home, Form5Home, etc.) and 'Expected Goals'
+        # are NOT available in the /fixtures/statistics endpoint example provided.
+        # You would need to check other API-Football endpoints (e.g., /teams/statistics
+        # with different parameters, or processing match history from /fixtures)
+        # to get these values if your model requires them to be dynamic.
+        # For now, these will retain their values from the sidebar input.
+        # =====================================================================
+
+        if any(fetched_stats.values()): # If any stats were actually fetched
+            st.success("✅ Live API data fetched successfully!")
+            return fetched_stats
         else:
-            st.warning(f"No API data found for '{home_team}' vs '{away_team}'. Using manual inputs.")
-            return None # Indicate no data was found for these teams
+            st.warning(f"API returned no relevant statistics for fixture {fixture_id_demo}. Using manual inputs.")
+            return None
 
     except requests.exceptions.RequestException as e:
         st.error(f"❌ API Request Failed: {e}")
+        st.info("Please ensure your API key is valid and the API allows requests from this environment.")
         return None
     except Exception as e:
         st.error(f"❌ Error processing API data: {e}")
         return None
-    # --- END OF CUSTOMIZABLE SECTION ---
 
 
 # =============================================================================
