@@ -242,8 +242,8 @@ with col_team2:
     away_team = st.text_input("Away Team", "Chelsea")
 
 # Fetch ELO ratings based on entered team names
-home_elo_value = get_elo_from_scraped_data(home_team)
-away_elo_value = get_elo_from_scraped_data(away_team)
+home_elo_value = float(get_elo_from_scraped_data(home_team))
+away_elo_value = float(get_elo_from_scraped_data(away_team))
 
 
 if outcome_model is None or goals_model is None:
