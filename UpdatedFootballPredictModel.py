@@ -8,6 +8,9 @@ from scipy.special import softmax
 import warnings
 import requests
 from datetime import datetime, timedelta
+from io import StringIO
+import time
+from typing import Dict, List, Optional
 
 # Suppress scikit-learn version warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -87,7 +90,7 @@ feature_columns = [
 ]
 
 # =============================================================================
-# ENHANCED API FOOTBALL INTEGRATION
+# ENHANCED API FOOTBALL INTEGRATION WITH ELO RATINGS
 # =============================================================================
 class FootballAPIFetcher:
     def __init__(self, api_key):
@@ -97,6 +100,149 @@ class FootballAPIFetcher:
             'x-rapidapi-key': api_key,
             'x-rapidapi-host': 'v3.football.api-sports.io'
         }
+        
+        # Team name mapping for ClubElo (API-Football name -> ClubElo name)
+        self.elo_team_mapping = {
+            'Arsenal': 'Arsenal',
+            'Aston Villa': 'Aston Villa',
+            'Bournemouth': 'Bournemouth',
+            'Brentford': 'Brentford',
+            'Brighton': 'Brighton and Hove Albion',
+            'Burnley': 'Burnley',
+            'Chelsea': 'Chelsea',
+            'Crystal Palace': 'Crystal Palace',
+            'Everton': 'Everton',
+            'Fulham': 'Fulham',
+            'Liverpool': 'Liverpool',
+            'Luton': 'Luton Town',
+            'Manchester City': 'Manchester City',
+            'Manchester United': 'Manchester United',
+            'Newcastle': 'Newcastle United',
+            'Nottingham Forest': 'Nottingham Forest',
+            'Sheffield United': 'Sheffield United',
+            'Tottenham': 'Tottenham Hotspur',
+            'West Ham': 'West Ham United',
+            'Wolves': 'Wolverhampton Wanderers',
+        }
+    
+    def get_elo_ratings(self, team_names: List[str]) -> Dict[str, float]:
+        """
+        Fetch Elo ratings from ClubElo for specified teams.
+        """
+        try:
+            # Try using soccerdata library first
+            return self._get_elo_ratings_soccerdata(team_names)
+        except ImportError:
+            st.info("📦 soccerdata not installed. Using direct CSV download method.")
+            return self._get_elo_ratings_fallback(team_names)
+        except Exception as e:
+            st.warning(f"⚠️ Primary Elo fetch failed: {e}. Using fallback method.")
+            return self._get_elo_ratings_fallback(team_names)
+    
+    def _get_elo_ratings_soccerdata(self, team_names: List[str]) -> Dict[str, float]:
+        """Fetch Elo ratings using soccerdata library"""
+        try:
+            import soccerdata as sd
+            
+            # Initialize ClubElo reader
+            elo = sd.ClubElo()
+            
+            # Get current ratings (latest snapshot)
+            current_ratings = elo.read_by_date()
+            
+            # Get the most recent ratings
+            latest_date = current_ratings.index.get_level_values('date').max()
+            latest_ratings = current_ratings.xs(latest_date, level='date')
+            
+            elo_dict = {}
+            for team in team_names:
+                # Map team name if needed
+                search_name = self.elo_team_mapping.get(team, team)
+                
+                # Try exact match first
+                if search_name in latest_ratings.index:
+                    elo_dict[team] = latest_ratings.loc[search_name, 'elo']
+                    st.info(f"✅ Found Elo for {team}: {elo_dict[team]:.1f}")
+                
+                # Try partial match if exact fails
+                else:
+                    matching_teams = latest_ratings.index[
+                        latest_ratings.index.str.contains(search_name, case=False)
+                    ]
+                    
+                    if not matching_teams.empty:
+                        elo_dict[team] = latest_ratings.loc[matching_teams[0], 'elo']
+                        st.info(f"✅ Found Elo for {team} (as {matching_teams[0]}): {elo_dict[team]:.1f}")
+                    else:
+                        # Default rating for unknown teams
+                        elo_dict[team] = 1500.0
+                        st.warning(f"⚠️ No Elo found for {team}, using default: 1500.0")
+                        
+            return elo_dict
+            
+        except Exception as e:
+            st.error(f"❌ Soccerdata Elo fetch failed: {e}")
+            raise
+    
+    def _get_elo_ratings_fallback(self, team_names: List[str]) -> Dict[str, float]:
+        """
+        Fallback method using direct CSV download from ClubElo API.
+        """
+        try:
+            # ClubElo provides CSV data at this endpoint
+            url = "http://api.clubelo.com/"
+            
+            # Add a small delay to be respectful to the server
+            time.sleep(0.5)
+            
+            response = requests.get(url, timeout=10)
+            
+            if response.status_code == 200:
+                # Parse CSV data
+                df = pd.read_csv(StringIO(response.text))
+                
+                # Create a dictionary of team ratings
+                ratings = dict(zip(df['club'], df['Elo']))
+                
+                elo_dict = {}
+                for team in team_names:
+                    # Map team name
+                    search_name = self.elo_team_mapping.get(team, team)
+                    
+                    # Try exact match
+                    if search_name in ratings:
+                        elo_dict[team] = ratings[search_name]
+                        st.info(f"✅ Found Elo for {team}: {elo_dict[team]:.1f}")
+                    
+                    # Try partial match
+                    else:
+                        matched_team = None
+                        for club in ratings.keys():
+                            if (search_name.lower() in club.lower() or 
+                                club.lower() in search_name.lower()):
+                                matched_team = club
+                                break
+                        
+                        if matched_team:
+                            elo_dict[team] = ratings[matched_team]
+                            st.info(f"✅ Found Elo for {team} (as {matched_team}): {elo_dict[team]:.1f}")
+                        else:
+                            # Default rating
+                            elo_dict[team] = 1500.0
+                            st.warning(f"⚠️ No Elo found for {team}, using default: 1500.0")
+                
+                return elo_dict
+                
+            else:
+                st.error(f"❌ Failed to fetch Elo data: HTTP {response.status_code}")
+                return {team: 1500.0 for team in team_names}
+                
+        except requests.Timeout:
+            st.error("❌ Elo API request timed out. Using default ratings.")
+            return {team: 1500.0 for team in team_names}
+        except Exception as e:
+            st.error(f"❌ Fallback Elo fetch failed: {e}")
+            return {team: 1500.0 for team in team_names}
     
     def find_team_id(self, team_name):
         """Find team ID by name"""
@@ -168,7 +314,7 @@ class FootballAPIFetcher:
         if response.status_code == 200:
             data = response.json()
             if data and data['response']:
-                matches = data['response']
+                matches = data['response'][:10]  # Last 10 matches
                 total_value = 0
                 match_count = 0
                 
@@ -254,74 +400,10 @@ class FootballAPIFetcher:
                 return total_goals / match_count if match_count > 0 else 1.5
         
         return 1.5  # Default value
-    
-    def get_head_to_head_stats(self, team1_id, team2_id, league_id, season):
-        """Get head-to-head statistics between two teams"""
-        params = {
-            "season": season,
-            "league": league_id,
-            "team": team1_id
-        }
-        
-        response = requests.get(f"{self.base_url}/fixtures", headers=self.headers, params=params)
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data and data['response']:
-                h2h_matches = []
-                for fixture in data['response']:
-                    home_id = fixture['teams']['home']['id']
-                    away_id = fixture['teams']['away']['id']
-                    
-                    if (home_id == team1_id and away_id == team2_id) or \
-                       (home_id == team2_id and away_id == team1_id):
-                        
-                        # Get statistics for this match
-                        stats_response = requests.get(
-                            f"{self.base_url}/fixtures/statistics",
-                            headers=self.headers,
-                            params={"fixture": fixture['fixture']['id']}
-                        )
-                        
-                        if stats_response.status_code == 200:
-                            stats_data = stats_response.json()
-                            h2h_matches.append(stats_data)
-                
-                if h2h_matches:
-                    # Calculate average stats from H2H matches
-                    avg_home_shots = 0
-                    avg_away_shots = 0
-                    avg_home_target = 0
-                    avg_away_target = 0
-                    
-                    for match_stats in h2h_matches:
-                        for team_stats in match_stats.get('response', []):
-                            if team_stats['team']['id'] == team1_id:
-                                for stat in team_stats['statistics']:
-                                    if stat['type'] == 'Total Shots' and stat['value']:
-                                        avg_home_shots += float(stat['value']) if stat['value'] else 0
-                                    elif stat['type'] == 'Shots on Goal' and stat['value']:
-                                        avg_home_target += float(stat['value']) if stat['value'] else 0
-                            elif team_stats['team']['id'] == team2_id:
-                                for stat in team_stats['statistics']:
-                                    if stat['type'] == 'Total Shots' and stat['value']:
-                                        avg_away_shots += float(stat['value']) if stat['value'] else 0
-                                    elif stat['type'] == 'Shots on Goal' and stat['value']:
-                                        avg_away_target += float(stat['value']) if stat['value'] else 0
-                    
-                    num_matches = len(h2h_matches)
-                    return {
-                        'HomeShots': avg_home_shots / num_matches if num_matches > 0 else 12,
-                        'AwayShots': avg_away_shots / num_matches if num_matches > 0 else 10,
-                        'HomeTarget': avg_home_target / num_matches if num_matches > 0 else 4,
-                        'AwayTarget': avg_away_target / num_matches if num_matches > 0 else 3
-                    }
-        
-        return None
 
 @st.cache_data(ttl=3600, show_spinner="Fetching live team statistics...")
 def fetch_complete_team_stats(home_team, away_team, api_key):
-    """Fetch all required statistics from API-Football"""
+    """Fetch all required statistics from API-Football including Elo ratings"""
     
     if not api_key:
         st.error("❌ API key not provided. Cannot fetch live data.")
@@ -334,7 +416,11 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
     season = 2024   # Current season
     
     try:
-        # Find team IDs
+        # Create progress indicators
+        progress_text = st.empty()
+        
+        # Step 1: Find team IDs
+        progress_text.info("🔍 Finding team IDs...")
         home_id = fetcher.find_team_id(home_team)
         away_id = fetcher.find_team_id(away_team)
         
@@ -342,45 +428,33 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
             st.warning(f"Could not find team IDs for {home_team} or {away_team}")
             return None
         
-        # Fetch form (last 3 and last 5 matches)
+        # Step 2: Get Elo ratings from ClubElo
+        progress_text.info("📊 Fetching Elo ratings from ClubElo...")
+        elo_ratings = fetcher.get_elo_ratings([home_team, away_team])
+        home_elo = elo_ratings.get(home_team, 1500.0)
+        away_elo = elo_ratings.get(away_team, 1500.0)
+        
+        # Step 3: Fetch form
+        progress_text.info("📈 Fetching team form...")
         form3_home = fetcher.get_team_form(home_id, league_id, season, 3)
         form5_home = fetcher.get_team_form(home_id, league_id, season, 5)
         form3_away = fetcher.get_team_form(away_id, league_id, season, 3)
         form5_away = fetcher.get_team_form(away_id, league_id, season, 5)
         
-        # Fetch average shots and shots on target
+        # Step 4: Fetch shooting statistics
+        progress_text.info("🎯 Fetching shooting statistics...")
         avg_home_shots = fetcher.get_team_average_stats(home_id, league_id, season, "Total Shots")
         avg_away_shots = fetcher.get_team_average_stats(away_id, league_id, season, "Total Shots")
         avg_home_target = fetcher.get_team_average_stats(home_id, league_id, season, "Shots on Goal")
         avg_away_target = fetcher.get_team_average_stats(away_id, league_id, season, "Shots on Goal")
         
-        # If averages are zero, try H2H stats
-        if avg_home_shots == 0 or avg_away_shots == 0:
-            h2h_stats = fetcher.get_head_to_head_stats(home_id, away_id, league_id, season)
-            if h2h_stats:
-                avg_home_shots = h2h_stats.get('HomeShots', avg_home_shots)
-                avg_away_shots = h2h_stats.get('AwayShots', avg_away_shots)
-                avg_home_target = h2h_stats.get('HomeTarget', avg_home_target)
-                avg_away_target = h2h_stats.get('AwayTarget', avg_away_target)
-        
-        # Fetch expected goals
+        # Step 5: Fetch expected goals
+        progress_text.info("⚽ Fetching expected goals...")
         home_xg = fetcher.get_expected_goals(home_id, league_id, season)
         away_xg = fetcher.get_expected_goals(away_id, league_id, season)
         
-        # Elo ratings (you might need a separate API or database for these)
-        # For now, using approximate values based on team strength
-        elo_ratings = {
-            'Manchester City': 2050, 'Liverpool': 2030, 'Arsenal': 2010,
-            'Chelsea': 1980, 'Manchester United': 1970, 'Tottenham': 1950,
-            'Newcastle': 1930, 'Aston Villa': 1900, 'Brighton': 1880,
-            'West Ham': 1860, 'Brentford': 1840, 'Crystal Palace': 1820,
-            'Wolves': 1800, 'Fulham': 1780, 'Everton': 1760,
-            'Nottingham Forest': 1740, 'Bournemouth': 1720, 'Sheffield United': 1700,
-            'Luton': 1680, 'Burnley': 1660
-        }
-        
-        home_elo = elo_ratings.get(home_team, 1800)
-        away_elo = elo_ratings.get(away_team, 1800)
+        # Clear progress text
+        progress_text.empty()
         
         # Compile all statistics
         stats = {
@@ -405,7 +479,7 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
             'Under25': 1.9
         }
         
-        st.success("✅ Successfully fetched live statistics from API-Football!")
+        st.success("✅ Successfully fetched live statistics from API-Football and ClubElo!")
         
         # Display fetched stats
         with st.expander("📊 Fetched Statistics"):
@@ -417,7 +491,7 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
                 st.metric("Avg Shots", f"{avg_home_shots:.1f}")
                 st.metric("Avg Shots on Target", f"{avg_home_target:.1f}")
                 st.metric("Expected Goals (xG)", f"{home_xg:.2f}")
-                st.metric("Elo Rating", f"{home_elo}")
+                st.metric("Elo Rating (ClubElo)", f"{home_elo:.1f}")
             
             with col2:
                 st.markdown(f"**{away_team}**")
@@ -426,7 +500,7 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
                 st.metric("Avg Shots", f"{avg_away_shots:.1f}")
                 st.metric("Avg Shots on Target", f"{avg_away_target:.1f}")
                 st.metric("Expected Goals (xG)", f"{away_xg:.2f}")
-                st.metric("Elo Rating", f"{away_elo}")
+                st.metric("Elo Rating (ClubElo)", f"{away_elo:.1f}")
         
         return stats
         
@@ -435,7 +509,7 @@ def fetch_complete_team_stats(home_team, away_team, api_key):
         return None
 
 # =============================================================================
-# HELPER FUNCTIONS (from original code)
+# HELPER FUNCTIONS
 # =============================================================================
 def clean_input_data(df):
     df = df.replace([np.inf, -np.inf], np.nan)
@@ -510,7 +584,7 @@ def preprocess_input_data(input_df, feature_columns):
 # =============================================================================
 st.set_page_config(page_title="Football Match Predictor", layout="wide")
 st.title("⚽ Football Match Predictor")
-st.markdown("Predict match outcomes using real-time statistics from API-Football")
+st.markdown("Predict match outcomes using real-time statistics from API-Football and Elo ratings from ClubElo")
 
 # Team input
 col1, col2 = st.columns(2)
@@ -519,13 +593,29 @@ with col1:
 with col2:
     away_team = st.text_input("🚗 Away Team", "Liverpool")
 
+# League and season selection
+col1, col2 = st.columns(2)
+with col1:
+    league_options = {
+        39: "Premier League (England)",
+        135: "Serie A (Italy)",
+        140: "La Liga (Spain)",
+        78: "Bundesliga (Germany)",
+        61: "Ligue 1 (France)"
+    }
+    selected_league = st.selectbox("🏆 Select League", options=list(league_options.keys()), 
+                                   format_func=lambda x: league_options[x])
+with col2:
+    current_year = datetime.now().year
+    season = st.number_input("📅 Season", min_value=2018, max_value=current_year, value=current_year)
+
 # Fetch button
 if st.button("🔍 Fetch Live Statistics & Predict", type="primary", use_container_width=True):
     if not API_FOOTBALL_KEY:
         st.error("❌ API key not configured. Please add API_FOOTBALL_KEY to your secrets.")
         st.stop()
     
-    with st.spinner("Fetching live statistics from API-Football..."):
+    with st.spinner("Fetching live statistics from API-Football and ClubElo..."):
         # Fetch statistics automatically
         fetched_stats = fetch_complete_team_stats(home_team, away_team, API_FOOTBALL_KEY)
         
@@ -565,9 +655,8 @@ if st.button("🔍 Fetch Live Statistics & Predict", type="primary", use_contain
                 col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    st.metric("🏆 Predicted Winner", 
-                             f"{home_team}" if predicted_outcome == 'H' else 
-                             f"{away_team}" if predicted_outcome == 'A' else "Draw")
+                    winner = f"{home_team}" if predicted_outcome == 'H' else f"{away_team}" if predicted_outcome == 'A' else "Draw"
+                    st.metric("🏆 Predicted Winner", winner)
                 
                 with col2:
                     st.metric("⚽ Predicted Total Goals", f"{round(goals_pred, 1)}")
@@ -593,7 +682,7 @@ if st.button("🔍 Fetch Live Statistics & Predict", type="primary", use_contain
                     st.caption(f"**Confidence:** {max(outcome_probs):.1%}")
                 
                 # Feature importance
-                with st.expander("🔧 Advanced Features"):
+                with st.expander("🔧 Advanced Features Used"):
                     st.json({k: float(v) for k, v in fetched_stats.items() if isinstance(v, (int, float))})
         else:
             st.error("❌ Failed to fetch statistics. Please check team names and try again.")
@@ -602,4 +691,4 @@ else:
 
 # Footer
 st.markdown("---")
-st.caption("Data source: API-Football v3 | Model: Gradient Boosting + XGBoost")
+st.caption("Data sources: API-Football v3 (match statistics) | ClubElo (Elo ratings) | Model: Gradient Boosting + XGBoost")
