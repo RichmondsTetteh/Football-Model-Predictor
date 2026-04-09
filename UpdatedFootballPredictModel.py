@@ -34,7 +34,7 @@ if "API_FOOTBALL_KEY" in st.secrets:
     st.info("API Key loaded from Streamlit Secrets.")
 elif os.environ.get("API_FOOTBALL_KEY"):
     API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY")
-    st.info("API Key loaded from environment variable (for local testing)."
+    st.info("API Key loaded from environment variable (for local testing).")
 else:
     API_FOOTBALL_KEY = "YOUR_API_FOOTBALL_KEY_HERE" # Fallback for local testing without env var
     st.warning("⚠️ API_FOOTBALL_KEY not found in Streamlit Secrets or environment variables. Please add it for live data fetching. Using placeholder.")
@@ -222,41 +222,72 @@ def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: 
 
     fetched_stats = {}
 
-    # =========================================================================
-    # ⚠️ IMPORTANT: RESOLVING TEAM AND FIXTURE IDs
-    # The /fixtures/statistics endpoint requires 'fixture_id' and 'team_id'.
-    # To make this fully dynamic, you would typically need to perform the
-    # following steps FIRST:
-    # 1. Use the '/teams' endpoint to get 'team_id' from 'home_team' and 'away_team' names.
-    # 2. Use the '/fixtures' endpoint (with team IDs, league, season, date, etc.)
-    #    to find the specific 'fixture_id' for the upcoming match between these teams.
-    # =========================================================================
+    # Helper to find team ID from name
+    def _find_team_id(team_name: str, headers: dict) -> int | None:
+        st.info(f"Searching for ID for team: {team_name}")
+        params = {"search": team_name}
+        response = requests.get(f"{BASE_API_URL}teams", headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        if data and data['response']:
+            # Try to find an exact match first
+            for team_info in data['response']:
+                if team_info['team']['name'].lower() == team_name.lower():
+                    return team_info['team']['id']
+            # If no exact match, take the first one found (might be imprecise)
+            if data['response']:
+                return data['response'][0]['team']['id']
+        st.warning(f"Could not find API Football ID for team: {team_name}")
+        return None
 
-    # For demonstration, we will use a hardcoded fixture_id and team_ids.
-    # REPLACE THIS LOGIC with dynamic fetching of fixture_id and team_ids!
-    if home_team.lower() == "team a" and away_team.lower() == "team b":
-        st.warning("Using dummy fixture_id and team_ids for 'Team A' vs 'Team B'.")
-        fixture_id_demo = 215662 # Example fixture ID
-        home_team_id_demo = 463 # Example team ID for home
-        away_team_id_demo = 464 # Example team ID for away (assuming another team)
-    elif home_team.lower() == "team c" and away_team.lower() == "team d":
-        st.warning("Using dummy fixture_id and team_ids for 'Team C' vs 'Team D'.")
-        fixture_id_demo = 215663 # Another example fixture ID
-        home_team_id_demo = 465 # Example team ID for home
-        away_team_id_demo = 466 # Example team ID for away
-    else:
-        st.warning(f"Cannot fetch live API data for '{home_team}' vs '{away_team}' without dynamic ID resolution. Using manual inputs.")
+    # Helper to find an upcoming fixture ID between two team IDs
+    def _find_fixture_id(home_team_id: int, away_team_id: int, headers: dict) -> int | None:
+        st.info(f"Searching for upcoming fixture between Home ID: {home_team_id} and Away ID: {away_team_id}")
+        current_year = pd.Timestamp.now().year
+
+        # Search for fixtures involving the home team for the current season, status 'NS' (Not Started)
+        params = {"team": home_team_id, "season": current_year, "status": "NS"}
+        response = requests.get(f"{BASE_API_URL}fixtures", headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+
+        if data and data['response']:
+            for fixture in data['response']:
+                # Check if the fixture involves both home and away teams in either order
+                if (fixture['teams']['home']['id'] == home_team_id and fixture['teams']['away']['id'] == away_team_id) or \
+                   (fixture['teams']['home']['id'] == away_team_id and fixture['teams']['away']['id'] == home_team_id):
+                    # Ensure it's a future match
+                    fixture_date = pd.to_datetime(fixture['fixture']['date'])
+                    if fixture_date > pd.Timestamp.now():
+                        st.success(f"Found upcoming fixture ID: {fixture['fixture']['id']}")
+                        return fixture['fixture']['id']
+        st.warning(f"Could not find an upcoming fixture between team IDs {home_team_id} and {away_team_id} for season {current_year}.")
         return None
 
     try:
+        # 1. Dynamically get team IDs
+        home_team_id = _find_team_id(home_team, HEADERS)
+        away_team_id = _find_team_id(away_team, HEADERS)
+
+        if home_team_id is None or away_team_id is None:
+            st.warning("One or both team IDs could not be resolved. Using manual inputs.")
+            return None
+
+        # 2. Dynamically get fixture ID
+        fixture_id = _find_fixture_id(home_team_id, away_team_id, HEADERS)
+
+        if fixture_id is None:
+            st.warning("Could not find an upcoming fixture between the resolved team IDs. Using manual inputs.")
+            return None
+
         # --- Fetch statistics for the Home Team ---
-        params_home = {"fixture": fixture_id_demo, "team": home_team_id_demo}
+        params_home = {"fixture": fixture_id, "team": home_team_id}
         response_home = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_home)
         response_home.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
         data_home = response_home.json()
 
         # --- Fetch statistics for the Away Team ---
-        params_away = {"fixture": fixture_id_demo, "team": away_team_id_demo}
+        params_away = {"fixture": fixture_id, "team": away_team_id}
         response_away = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_away)
         response_away.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
         data_away = response_away.json()
@@ -265,7 +296,8 @@ def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: 
         def get_stat_value(data_response, stat_type):
             if data_response and data_response['response']:
                 for team_stats in data_response['response']:
-                    if team_stats['team']['id'] == params_home['team'] or team_stats['team']['id'] == params_away['team']:
+                    # Match the team_id in the response to either home or away team ID
+                    if team_stats['team']['id'] == home_team_id or team_stats['team']['id'] == away_team_id:
                         for stat in team_stats['statistics']:
                             if stat['type'] == stat_type:
                                 return stat['value'] if stat['value'] is not None else 0
@@ -293,7 +325,7 @@ def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: 
             st.success("✅ Live API data fetched successfully!")
             return fetched_stats
         else:
-            st.warning(f"API returned no relevant statistics for fixture {fixture_id_demo}. Using manual inputs.")
+            st.warning(f"API returned no relevant statistics for fixture {fixture_id}. Using manual inputs.")
             return None
 
     except requests.exceptions.RequestException as e:
