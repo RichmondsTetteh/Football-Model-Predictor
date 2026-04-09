@@ -6,7 +6,8 @@ import os
 from sklearn.preprocessing import LabelEncoder
 from scipy.special import softmax
 import warnings
-import requests # Import the requests library for API calls
+import requests
+from datetime import datetime, timedelta
 
 # Suppress scikit-learn version warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -27,17 +28,15 @@ CLUSTER_KMEANS_FILENAME = os.path.join(BASE_DIR, 'cluster_kmeans_model.joblib')
 # =============================================================================
 # API KEY MANAGEMENT
 # =============================================================================
-# For Streamlit Cloud deployment, use st.secrets.
-# For local testing, you can set it as an environment variable or define it here.
 if "API_FOOTBALL_KEY" in st.secrets:
     API_FOOTBALL_KEY = st.secrets["API_FOOTBALL_KEY"]
-    st.info("API Key loaded from Streamlit Secrets.")
+    st.success("✅ API Key loaded from Streamlit Secrets.")
 elif os.environ.get("API_FOOTBALL_KEY"):
     API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY")
-    st.info("API Key loaded from environment variable (for local testing).")
+    st.success("✅ API Key loaded from environment variable.")
 else:
-    API_FOOTBALL_KEY = "YOUR_API_FOOTBALL_KEY_HERE" # Fallback for local testing without env var
-    st.warning("⚠️ API_FOOTBALL_KEY not found in Streamlit Secrets or environment variables. Please add it for live data fetching. Using placeholder.")
+    API_FOOTBALL_KEY = None
+    st.warning("⚠️ API_FOOTBALL_KEY not found. Please add it to fetch live data.")
 
 # =============================================================================
 # RESOURCE LOADING
@@ -47,19 +46,17 @@ def load_resources():
     try:
         outcome_model = joblib.load(OUTCOME_MODEL_FILENAME)
         goals_model = joblib.load(GOALS_MODEL_FILENAME)
-
+        
         try:
             label_encoder = joblib.load(LABEL_ENCODER_FILENAME)
         except FileNotFoundError:
             label_encoder = LabelEncoder()
             label_encoder.fit(['A', 'D', 'H'])
-
+        
         return outcome_model, goals_model, label_encoder
     except Exception as e:
         st.error(f"❌ Failed to load main models: {e}")
-        st.info(f"Looking for files in: {BASE_DIR}")
         return None, None, None
-
 
 @st.cache_resource(show_spinner="Loading cluster models...")
 def load_cluster_models():
@@ -67,16 +64,11 @@ def load_cluster_models():
         try:
             scaler = joblib.load(CLUSTER_SCALER_FILENAME)
             kmeans = joblib.load(CLUSTER_KMEANS_FILENAME)
-            st.success("✅ Cluster models loaded successfully!")
             return scaler, kmeans
         except Exception as e:
             st.error(f"❌ Error loading cluster models: {e}")
             return None, None
-    else:
-        st.error("❌ Cluster models not found.")
-        st.info("Make sure cluster_robust_scaler.joblib and cluster_kmeans_model.joblib are in the repository root.")
-        return None, None
-
+    return None, None
 
 outcome_model, goals_model, label_encoder = load_resources()
 cluster_scaler, kmeans_model = load_cluster_models()
@@ -94,14 +86,356 @@ feature_columns = [
     'C_VAD', 'C_HTB', 'C_PHB'
 ]
 
-base_columns = [
-    'HomeElo', 'AwayElo', 'Form3Home', 'Form5Home', 'Form3Away', 'Form5Away',
-    'HomeShots', 'AwayShots', 'HomeTarget', 'AwayTarget',
-    'OddHome', 'OddDraw', 'OddAway', 'HandiSize', 'Over25', 'Under25'
-]
+# =============================================================================
+# ENHANCED API FOOTBALL INTEGRATION
+# =============================================================================
+class FootballAPIFetcher:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://v3.football.api-sports.io"
+        self.headers = {
+            'x-rapidapi-key': api_key,
+            'x-rapidapi-host': 'v3.football.api-sports.io'
+        }
+    
+    def find_team_id(self, team_name):
+        """Find team ID by name"""
+        params = {"search": team_name}
+        response = requests.get(f"{self.base_url}/teams", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data['response']:
+                # Try exact match first
+                for team_info in data['response']:
+                    if team_info['team']['name'].lower() == team_name.lower():
+                        return team_info['team']['id']
+                # Return first match
+                return data['response'][0]['team']['id']
+        return None
+    
+    def get_team_form(self, team_id, league_id, season, num_matches=5):
+        """Calculate team form from last N matches"""
+        params = {
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "status": "FT"  # Finished matches only
+        }
+        
+        response = requests.get(f"{self.base_url}/fixtures", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data['response']:
+                # Sort by date descending and take last N matches
+                matches = sorted(data['response'], 
+                               key=lambda x: x['fixture']['date'], 
+                               reverse=True)[:num_matches]
+                
+                points = 0
+                for match in matches:
+                    home_id = match['teams']['home']['id']
+                    away_id = match['teams']['away']['id']
+                    home_goals = match['goals']['home'] or 0
+                    away_goals = match['goals']['away'] or 0
+                    
+                    if team_id == home_id:
+                        if home_goals > away_goals:
+                            points += 3
+                        elif home_goals == away_goals:
+                            points += 1
+                    else:
+                        if away_goals > home_goals:
+                            points += 3
+                        elif away_goals == home_goals:
+                            points += 1
+                
+                return points
+        return 0
+    
+    def get_team_average_stats(self, team_id, league_id, season, stat_type):
+        """Get average statistics for a team in a season"""
+        params = {
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "status": "FT"
+        }
+        
+        response = requests.get(f"{self.base_url}/fixtures", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data['response']:
+                matches = data['response']
+                total_value = 0
+                match_count = 0
+                
+                for match in matches:
+                    # Get statistics for this match
+                    stats_response = requests.get(
+                        f"{self.base_url}/fixtures/statistics", 
+                        headers=self.headers, 
+                        params={"fixture": match['fixture']['id']}
+                    )
+                    
+                    if stats_response.status_code == 200:
+                        stats_data = stats_response.json()
+                        if stats_data and stats_data['response']:
+                            for team_stats in stats_data['response']:
+                                if team_stats['team']['id'] == team_id:
+                                    for stat in team_stats['statistics']:
+                                        if stat['type'] == stat_type and stat['value'] is not None:
+                                            # Handle percentage strings
+                                            if isinstance(stat['value'], str) and '%' in stat['value']:
+                                                value = float(stat['value'].replace('%', ''))
+                                            else:
+                                                try:
+                                                    value = float(stat['value'])
+                                                except (ValueError, TypeError):
+                                                    value = 0
+                                            total_value += value
+                                            match_count += 1
+                                            break
+                
+                return total_value / match_count if match_count > 0 else 0
+        return 0
+    
+    def get_expected_goals(self, team_id, league_id, season):
+        """Get expected goals (xG) for a team"""
+        # Try to get from team statistics endpoint
+        params = {
+            "team": team_id,
+            "league": league_id,
+            "season": season
+        }
+        
+        response = requests.get(f"{self.base_url}/teams/statistics", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data.get('response'):
+                # Look for xG in statistics
+                for stat in data['response'].get('statistics', []):
+                    if stat.get('type') == 'Expected Goals':
+                        value = stat.get('value')
+                        if value is not None:
+                            try:
+                                return float(value)
+                            except (ValueError, TypeError):
+                                pass
+        
+        # Fallback: calculate from recent matches
+        params = {
+            "team": team_id,
+            "league": league_id,
+            "season": season,
+            "status": "FT"
+        }
+        
+        response = requests.get(f"{self.base_url}/fixtures", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data['response']:
+                matches = data['response'][:10]  # Last 10 matches
+                total_goals = 0
+                match_count = 0
+                
+                for match in matches:
+                    if team_id == match['teams']['home']['id']:
+                        goals = match['goals']['home'] or 0
+                    else:
+                        goals = match['goals']['away'] or 0
+                    total_goals += goals
+                    match_count += 1
+                
+                return total_goals / match_count if match_count > 0 else 1.5
+        
+        return 1.5  # Default value
+    
+    def get_head_to_head_stats(self, team1_id, team2_id, league_id, season):
+        """Get head-to-head statistics between two teams"""
+        params = {
+            "season": season,
+            "league": league_id,
+            "team": team1_id
+        }
+        
+        response = requests.get(f"{self.base_url}/fixtures", headers=self.headers, params=params)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data and data['response']:
+                h2h_matches = []
+                for fixture in data['response']:
+                    home_id = fixture['teams']['home']['id']
+                    away_id = fixture['teams']['away']['id']
+                    
+                    if (home_id == team1_id and away_id == team2_id) or \
+                       (home_id == team2_id and away_id == team1_id):
+                        
+                        # Get statistics for this match
+                        stats_response = requests.get(
+                            f"{self.base_url}/fixtures/statistics",
+                            headers=self.headers,
+                            params={"fixture": fixture['fixture']['id']}
+                        )
+                        
+                        if stats_response.status_code == 200:
+                            stats_data = stats_response.json()
+                            h2h_matches.append(stats_data)
+                
+                if h2h_matches:
+                    # Calculate average stats from H2H matches
+                    avg_home_shots = 0
+                    avg_away_shots = 0
+                    avg_home_target = 0
+                    avg_away_target = 0
+                    
+                    for match_stats in h2h_matches:
+                        for team_stats in match_stats.get('response', []):
+                            if team_stats['team']['id'] == team1_id:
+                                for stat in team_stats['statistics']:
+                                    if stat['type'] == 'Total Shots' and stat['value']:
+                                        avg_home_shots += float(stat['value']) if stat['value'] else 0
+                                    elif stat['type'] == 'Shots on Goal' and stat['value']:
+                                        avg_home_target += float(stat['value']) if stat['value'] else 0
+                            elif team_stats['team']['id'] == team2_id:
+                                for stat in team_stats['statistics']:
+                                    if stat['type'] == 'Total Shots' and stat['value']:
+                                        avg_away_shots += float(stat['value']) if stat['value'] else 0
+                                    elif stat['type'] == 'Shots on Goal' and stat['value']:
+                                        avg_away_target += float(stat['value']) if stat['value'] else 0
+                    
+                    num_matches = len(h2h_matches)
+                    return {
+                        'HomeShots': avg_home_shots / num_matches if num_matches > 0 else 12,
+                        'AwayShots': avg_away_shots / num_matches if num_matches > 0 else 10,
+                        'HomeTarget': avg_home_target / num_matches if num_matches > 0 else 4,
+                        'AwayTarget': avg_away_target / num_matches if num_matches > 0 else 3
+                    }
+        
+        return None
+
+@st.cache_data(ttl=3600, show_spinner="Fetching live team statistics...")
+def fetch_complete_team_stats(home_team, away_team, api_key):
+    """Fetch all required statistics from API-Football"""
+    
+    if not api_key:
+        st.error("❌ API key not provided. Cannot fetch live data.")
+        return None
+    
+    fetcher = FootballAPIFetcher(api_key)
+    
+    # Configuration
+    league_id = 39  # Premier League (you can make this dynamic)
+    season = 2024   # Current season
+    
+    try:
+        # Find team IDs
+        home_id = fetcher.find_team_id(home_team)
+        away_id = fetcher.find_team_id(away_team)
+        
+        if not home_id or not away_id:
+            st.warning(f"Could not find team IDs for {home_team} or {away_team}")
+            return None
+        
+        # Fetch form (last 3 and last 5 matches)
+        form3_home = fetcher.get_team_form(home_id, league_id, season, 3)
+        form5_home = fetcher.get_team_form(home_id, league_id, season, 5)
+        form3_away = fetcher.get_team_form(away_id, league_id, season, 3)
+        form5_away = fetcher.get_team_form(away_id, league_id, season, 5)
+        
+        # Fetch average shots and shots on target
+        avg_home_shots = fetcher.get_team_average_stats(home_id, league_id, season, "Total Shots")
+        avg_away_shots = fetcher.get_team_average_stats(away_id, league_id, season, "Total Shots")
+        avg_home_target = fetcher.get_team_average_stats(home_id, league_id, season, "Shots on Goal")
+        avg_away_target = fetcher.get_team_average_stats(away_id, league_id, season, "Shots on Goal")
+        
+        # If averages are zero, try H2H stats
+        if avg_home_shots == 0 or avg_away_shots == 0:
+            h2h_stats = fetcher.get_head_to_head_stats(home_id, away_id, league_id, season)
+            if h2h_stats:
+                avg_home_shots = h2h_stats.get('HomeShots', avg_home_shots)
+                avg_away_shots = h2h_stats.get('AwayShots', avg_away_shots)
+                avg_home_target = h2h_stats.get('HomeTarget', avg_home_target)
+                avg_away_target = h2h_stats.get('AwayTarget', avg_away_target)
+        
+        # Fetch expected goals
+        home_xg = fetcher.get_expected_goals(home_id, league_id, season)
+        away_xg = fetcher.get_expected_goals(away_id, league_id, season)
+        
+        # Elo ratings (you might need a separate API or database for these)
+        # For now, using approximate values based on team strength
+        elo_ratings = {
+            'Manchester City': 2050, 'Liverpool': 2030, 'Arsenal': 2010,
+            'Chelsea': 1980, 'Manchester United': 1970, 'Tottenham': 1950,
+            'Newcastle': 1930, 'Aston Villa': 1900, 'Brighton': 1880,
+            'West Ham': 1860, 'Brentford': 1840, 'Crystal Palace': 1820,
+            'Wolves': 1800, 'Fulham': 1780, 'Everton': 1760,
+            'Nottingham Forest': 1740, 'Bournemouth': 1720, 'Sheffield United': 1700,
+            'Luton': 1680, 'Burnley': 1660
+        }
+        
+        home_elo = elo_ratings.get(home_team, 1800)
+        away_elo = elo_ratings.get(away_team, 1800)
+        
+        # Compile all statistics
+        stats = {
+            'HomeElo': home_elo,
+            'AwayElo': away_elo,
+            'Form3Home': form3_home,
+            'Form5Home': form5_home,
+            'Form3Away': form3_away,
+            'Form5Away': form5_away,
+            'HomeShots': max(avg_home_shots, 8.0),  # Minimum reasonable value
+            'AwayShots': max(avg_away_shots, 6.0),
+            'HomeTarget': max(avg_home_target, 3.0),
+            'AwayTarget': max(avg_away_target, 2.0),
+            'HomeExpectedGoals': home_xg,
+            'AwayExpectedGoals': away_xg,
+            # Default values for other required fields
+            'OddHome': 2.0,
+            'OddDraw': 3.2,
+            'OddAway': 3.5,
+            'HandiSize': 0.0,
+            'Over25': 1.9,
+            'Under25': 1.9
+        }
+        
+        st.success("✅ Successfully fetched live statistics from API-Football!")
+        
+        # Display fetched stats
+        with st.expander("📊 Fetched Statistics"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**{home_team}**")
+                st.metric("Form (last 3)", f"{form3_home}/9 points")
+                st.metric("Form (last 5)", f"{form5_home}/15 points")
+                st.metric("Avg Shots", f"{avg_home_shots:.1f}")
+                st.metric("Avg Shots on Target", f"{avg_home_target:.1f}")
+                st.metric("Expected Goals (xG)", f"{home_xg:.2f}")
+                st.metric("Elo Rating", f"{home_elo}")
+            
+            with col2:
+                st.markdown(f"**{away_team}**")
+                st.metric("Form (last 3)", f"{form3_away}/9 points")
+                st.metric("Form (last 5)", f"{form5_away}/15 points")
+                st.metric("Avg Shots", f"{avg_away_shots:.1f}")
+                st.metric("Avg Shots on Target", f"{avg_away_target:.1f}")
+                st.metric("Expected Goals (xG)", f"{away_xg:.2f}")
+                st.metric("Elo Rating", f"{away_elo}")
+        
+        return stats
+        
+    except Exception as e:
+        st.error(f"❌ Error fetching data: {e}")
+        return None
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS (from original code)
 # =============================================================================
 def clean_input_data(df):
     df = df.replace([np.inf, -np.inf], np.nan)
@@ -110,11 +444,7 @@ def clean_input_data(df):
         df[col] = df[col].fillna(df[col].median() if len(df) > 0 else 0.0)
     return df
 
-
 def compute_cluster_features(row):
-    """Return EXACT raw columns the scaler was fitted on"""
-    # Ensure the order of features matches the order used during fitting
-    # (HomeShots, AwayShots, HomeTarget, AwayTarget, HomeElo, AwayElo)
     return pd.DataFrame([
         {
             'HomeShots': row.get('HomeShots', 12.0),
@@ -126,27 +456,22 @@ def compute_cluster_features(row):
         }
     ])
 
-
 def get_cluster_probabilities(row):
     if cluster_scaler is None or kmeans_model is None:
         return {'C_LTH': 0.0, 'C_LTA': 0.0, 'C_VHD': 0.0,
                 'C_VAD': 0.0, 'C_HTB': 0.0, 'C_PHB': 0.0}
-
+    
     try:
         X = compute_cluster_features(row)
         X_scaled = cluster_scaler.transform(X)
-
         distances = np.linalg.norm(X_scaled[:, np.newaxis] - kmeans_model.cluster_centers_, axis=2)
         probas = softmax(-distances, axis=1)[0]
-
         cluster_names = ['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']
         return dict(zip(cluster_names, probas))
-
     except Exception as e:
-        st.warning(f"Cluster computation failed: {e}. Using fallback (0.0).")
+        st.warning(f"Cluster computation failed: {e}")
         return {'C_LTH': 0.0, 'C_LTA': 0.0, 'C_VHD': 0.0,
                 'C_VAD': 0.0, 'C_HTB': 0.0, 'C_PHB': 0.0}
-
 
 def create_input_features(df):
     df = df.copy()
@@ -163,309 +488,118 @@ def create_input_features(df):
     df['AwayAttackStrength'] = df['AwayExpectedGoals'] * df['Form5Away'] / 15
     return df
 
-
 def preprocess_input_data(input_df, feature_columns):
-    defaults = {
-        'HomeShots': 12.0, 'AwayShots': 10.0, 'HomeTarget': 4.0, 'AwayTarget': 3.0,
-        'OddHome': 2.0, 'OddDraw': 3.0, 'OddAway': 3.0,
-        'HomeExpectedGoals': 1.5, 'AwayExpectedGoals': 1.2,
-        'Form3Home': 0, 'Form5Home': 0, 'Form3Away': 0, 'Form5Away': 0,
-        'HandiSize': 0.0, 'Over25': 2.0, 'Under25': 2.0,
-    }
-
-    for col in base_columns + ['HomeExpectedGoals', 'AwayExpectedGoals']:
-        if col not in input_df.columns:
-            input_df[col] = defaults.get(col, 0.0)
-
     cleaned_df = clean_input_data(input_df)
     featured_df = create_input_features(cleaned_df)
-
+    
     # Compute clusters automatically
     cluster_dict = get_cluster_probabilities(featured_df.iloc[0])
     for col, val in cluster_dict.items():
         featured_df[col] = val
-
+    
     missing = [col for col in feature_columns if col not in featured_df.columns]
     if missing:
-        st.warning(f"⚠️ Missing features: {missing}. Using 0 as fallback.")
         for col in missing:
             featured_df[col] = 0.0
-
+    
     processed_features = featured_df[feature_columns].fillna(0)
     return processed_features
 
-
 # =============================================================================
-# API FOOTBALL INTEGRATION FUNCTION
+# STREAMLIT UI
 # =============================================================================
-@st.cache_data(ttl=3600) # Cache API responses for 1 hour
-def fetch_team_stats_from_api_football(home_team: str, away_team: str, api_key: str):
-    """
-    Fetches team statistics from API-Football v3 service.
-
-    Args:
-        home_team (str): The name of the home team.
-        away_team (str): The name of the away team.
-        api_key (str): Your API Football key.
-
-    Returns:
-        dict: A dictionary containing the fetched statistics, or None if an error occurs.
-              The keys should match the input_config keys (e.g., 'Form3Home', 'HomeShots').
-    """
-    st.info(f"Attempting to fetch stats for {home_team} vs {away_team} using API-Football v3...")
-
-    BASE_API_URL = "https://v3.football.api-sports.io/"
-    HEADERS = {
-        'x-rapidapi-key': api_key,
-        'x-rapidapi-host': 'v3.football.api-sports.io'
-    }
-
-    fetched_stats = {}
-
-    # Helper to find team ID from name
-    def _find_team_id(team_name: str, headers: dict) -> int | None:
-        st.info(f"Searching for ID for team: {team_name}")
-        params = {"search": team_name}
-        response = requests.get(f"{BASE_API_URL}teams", headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if data and data['response']:
-            # Try to find an exact match first
-            for team_info in data['response']:
-                if team_info['team']['name'].lower() == team_name.lower():
-                    return team_info['team']['id']
-            # If no exact match, take the first one found (might be imprecise)
-            if data['response']:
-                return data['response'][0]['team']['id']
-        st.warning(f"Could not find API Football ID for team: {team_name}")
-        return None
-
-    # Helper to find an upcoming fixture ID between two team IDs
-    def _find_fixture_id(home_team_id: int, away_team_id: int, headers: dict) -> int | None:
-        st.info(f"Searching for upcoming fixture between Home ID: {home_team_id} and Away ID: {away_team_id}")
-        current_year = pd.Timestamp.now().year
-
-        # Search for fixtures involving the home team for the current season, status 'NS' (Not Started)
-        params = {"team": home_team_id, "season": current_year, "status": "NS"}
-        response = requests.get(f"{BASE_API_URL}fixtures", headers=headers, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-        if data and data['response']:
-            for fixture in data['response']:
-                # Check if the fixture involves both home and away teams in either order
-                if (fixture['teams']['home']['id'] == home_team_id and fixture['teams']['away']['id'] == away_team_id) or \
-                   (fixture['teams']['home']['id'] == away_team_id and fixture['teams']['away']['id'] == home_team_id):
-                    # Ensure it's a future match
-                    fixture_date = pd.to_datetime(fixture['fixture']['date'])
-                    if fixture_date > pd.Timestamp.now():
-                        st.success(f"Found upcoming fixture ID: {fixture['fixture']['id']}")
-                        return fixture['fixture']['id']
-        st.warning(f"Could not find an upcoming fixture between team IDs {home_team_id} and {away_team_id} for season {current_year}.")
-        return None
-
-    try:
-        # 1. Dynamically get team IDs
-        home_team_id = _find_team_id(home_team, HEADERS)
-        away_team_id = _find_team_id(away_team, HEADERS)
-
-        if home_team_id is None or away_team_id is None:
-            st.warning("One or both team IDs could not be resolved. Using manual inputs.")
-            return None
-
-        # 2. Dynamically get fixture ID
-        fixture_id = _find_fixture_id(home_team_id, away_team_id, HEADERS)
-
-        if fixture_id is None:
-            st.warning("Could not find an upcoming fixture between the resolved team IDs. Using manual inputs.")
-            return None
-
-        # --- Fetch statistics for the Home Team ---
-        params_home = {"fixture": fixture_id, "team": home_team_id}
-        response_home = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_home)
-        response_home.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
-        data_home = response_home.json()
-
-        # --- Fetch statistics for the Away Team ---
-        params_away = {"fixture": fixture_id, "team": away_team_id}
-        response_away = requests.get(f"{BASE_API_URL}fixtures/statistics", headers=HEADERS, params=params_away)
-        response_away.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
-        data_away = response_away.json()
-
-        # Helper to extract a statistic
-        def get_stat_value(data_response, stat_type):
-            if data_response and data_response['response']:
-                for team_stats in data_response['response']:
-                    # Match the team_id in the response to either home or away team ID
-                    if team_stats['team']['id'] == home_team_id or team_stats['team']['id'] == away_team_id:
-                        for stat in team_stats['statistics']:
-                            if stat['type'] == stat_type:
-                                return stat['value'] if stat['value'] is not None else 0
-            return 0
-
-        # Parse Home Team Stats
-        fetched_stats['HomeShots'] = get_stat_value(data_home, "Total Shots")
-        fetched_stats['HomeTarget'] = get_stat_value(data_home, "Shots on Goal")
-
-        # Parse Away Team Stats
-        fetched_stats['AwayShots'] = get_stat_value(data_away, "Total Shots")
-        fetched_stats['AwayTarget'] = get_stat_value(data_away, "Shots on Goal")
-
-        # =====================================================================
-        # ⚠️ MISSING STATISTICS:
-        # 'Form' data (Form3Home, Form5Home, etc.) and 'Expected Goals'
-        # are NOT available in the /fixtures/statistics endpoint example provided.
-        # You would need to check other API-Football endpoints (e.g., /teams/statistics
-        # with different parameters, or processing match history from /fixtures)
-        # to get these values if your model requires them to be dynamic.
-        # For now, these will retain their values from the sidebar input.
-        # =====================================================================
-
-        if any(fetched_stats.values()): # If any stats were actually fetched
-            st.success("✅ Live API data fetched successfully!")
-            return fetched_stats
-        else:
-            st.warning(f"API returned no relevant statistics for fixture {fixture_id}. Using manual inputs.")
-            return None
-
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ API Request Failed: {e}")
-        st.info("Please ensure your API key is valid and the API allows requests from this environment.")
-        return None
-    except Exception as e:
-        st.error(f"❌ Error processing API data: {e}")
-        return None
-
-
-# =============================================================================
-# STREAMLIT APP
-# =============================================================================
+st.set_page_config(page_title="Football Match Predictor", layout="wide")
 st.title("⚽ Football Match Predictor")
-st.markdown("Predict match outcome, total goals, and probabilities using Gradient Boosting + XGBoost models.")
+st.markdown("Predict match outcomes using real-time statistics from API-Football")
 
-col_team1, col_team2 = st.columns(2)
-with col_team1:
-    home_team = st.text_input("Home Team", "Team A")
-with col_team2:
-    away_team = st.text_input("Away Team", "Team B")
+# Team input
+col1, col2 = st.columns(2)
+with col1:
+    home_team = st.text_input("🏠 Home Team", "Arsenal")
+with col2:
+    away_team = st.text_input("🚗 Away Team", "Liverpool")
 
-if outcome_model is None or goals_model is None:
-    st.error("❌ Models could not be loaded.")
-    st.stop()
-
-st.sidebar.subheader("Match Statistics")
-
-# Initialize feature_input_values with default values. These will be updated if API data is fetched.
-input_config = {
-    'HomeElo': {'label': "🏠 Home Elo Rating", 'value': 1500.0, 'step': 1.0},
-    'AwayElo': {'label': "🏟️ Away Elo Rating", 'value': 1500.0, 'step': 1.0},
-    'Form3Home': {'label': "📈 Home Form (last 3)", 'value': 0, 'min': 0, 'max': 9, 'step': 1},
-    'Form5Home': {'label': "📈 Home Form (last 5)", 'value': 0, 'min': 0, 'max': 15, 'step': 1},
-    'Form3Away': {'label': "📉 Away Form (last 3)", 'value': 0, 'min': 0, 'max': 9, 'step': 1},
-    'Form5Away': {'label': "📉 Away Form (last 5)", 'value': 0, 'min': 0, 'max': 15, 'step': 1},
-    'HomeShots': {'label': "🔫 Home Shots (expected)", 'value': 12.0, 'min': 0.0, 'max': 30.0, 'step': 1.0},
-    'AwayShots': {'label': "🔫 Away Shots (expected)", 'value': 10.0, 'min': 0.0, 'max': 30.0, 'step': 1.0},
-    'HomeTarget': {'label': "🎯 Home Shots on Target", 'value': 4.0, 'min': 0.0, 'max': 15.0, 'step': 1.0},
-    'AwayTarget': {'label': "🎯 Away Shots on Target", 'value': 3.0, 'min': 0.0, 'max': 15.0, 'step': 1.0},
-    'HomeExpectedGoals': {'label': "🏆 Home Expected Goals", 'value': 1.5, 'min': 0.0, 'max': 5.0, 'step': 0.1},
-    'AwayExpectedGoals': {'label': "🏆 Away Expected Goals", 'value': 1.2, 'min': 0.0, 'max': 5.0, 'step': 0.1},
-    'OddHome': {'label': "💰 Home Win Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
-    'OddDraw': {'label': "💰 Draw Odds", 'value': 3.0, 'min': 1.0, 'step': 0.1},
-    'OddAway': {'label': "💰 Away Win Odds", 'value': 3.0, 'min': 1.0, 'step': 0.1},
-    'HandiSize': {'label': "📏 Handicap Size", 'value': 0.0, 'min': -2.0, 'max': 2.0, 'step': 0.25},
-    'Over25': {'label': "📈 Over 2.5 Goals Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
-    'Under25': {'label': "📉 Under 2.5 Goals Odds", 'value': 2.0, 'min': 1.0, 'step': 0.1},
-}
-
-# Use st.session_state to persist feature_input_values across reruns
-if 'feature_input_values' not in st.session_state:
-    st.session_state.feature_input_values = {col: cfg['value'] for col, cfg in input_config.items()}
-
-# Dynamic default values for the sidebar inputs
-feature_input_values_ui = {}
-for col, cfg in input_config.items():
-    # Use the value from session_state as the default for the number_input
-    st.session_state.feature_input_values[col] = st.sidebar.number_input(
-        label=cfg['label'],
-        value=st.session_state.feature_input_values.get(col, cfg['value']), # Use session state value first
-        step=cfg.get('step', 0.1),
-        min_value=cfg.get('min', None),
-        max_value=cfg.get('max', None),
-        key=f"sidebar_input_{col}" # Add a unique key for each widget
-    )
-
-# When the predict button is clicked, we'll try to fetch API data FIRST
-if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
-    with st.spinner("Fetching live data and making predictions..."):
-        fetched_stats = fetch_team_stats_from_api_football(home_team, away_team, API_FOOTBALL_KEY)
-
-        if fetched_stats: # If API data was successfully fetched
-            # Update the session state with fetched values
-            for stat_key, stat_value in fetched_stats.items():
-                if stat_key in st.session_state.feature_input_values:
-                    st.session_state.feature_input_values[stat_key] = stat_value
-            st.success("API data integrated! Generating prediction.")
+# Fetch button
+if st.button("🔍 Fetch Live Statistics & Predict", type="primary", use_container_width=True):
+    if not API_FOOTBALL_KEY:
+        st.error("❌ API key not configured. Please add API_FOOTBALL_KEY to your secrets.")
+        st.stop()
+    
+    with st.spinner("Fetching live statistics from API-Football..."):
+        # Fetch statistics automatically
+        fetched_stats = fetch_complete_team_stats(home_team, away_team, API_FOOTBALL_KEY)
+        
+        if fetched_stats:
+            # Create input dataframe
+            input_data = {
+                'HomeTeam': home_team,
+                'AwayTeam': away_team,
+                **fetched_stats
+            }
+            input_df_raw = pd.DataFrame([input_data])
+            
+            # Preprocess and predict
+            processed_features = preprocess_input_data(input_df_raw, feature_columns)
+            
+            if processed_features is not None and outcome_model and goals_model:
+                # Make predictions
+                outcome_encoded = outcome_model.predict(processed_features)[0]
+                goals_pred = goals_model.predict(processed_features)[0]
+                
+                # Get probabilities
+                outcome_probs = None
+                if hasattr(outcome_model, 'predict_proba'):
+                    outcome_probs = outcome_model.predict_proba(processed_features)[0]
+                
+                # Decode outcome
+                classes = getattr(label_encoder, 'classes_', outcome_model.classes_)
+                try:
+                    predicted_outcome = label_encoder.inverse_transform([outcome_encoded])[0]
+                except:
+                    predicted_outcome = classes[outcome_encoded]
+                
+                # Display results
+                st.success("✅ Prediction Complete!")
+                
+                # Results layout
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("🏆 Predicted Winner", 
+                             f"{home_team}" if predicted_outcome == 'H' else 
+                             f"{away_team}" if predicted_outcome == 'A' else "Draw")
+                
+                with col2:
+                    st.metric("⚽ Predicted Total Goals", f"{round(goals_pred, 1)}")
+                
+                with col3:
+                    over_under = "Over 2.5" if goals_pred > 2.5 else "Under 2.5"
+                    st.metric("📈 Over/Under", over_under)
+                
+                # Probability chart
+                if outcome_probs is not None:
+                    st.subheader("📊 Outcome Probabilities")
+                    probs_dict = {}
+                    for i, cls in enumerate(classes):
+                        if cls == 'H':
+                            probs_dict[f"{home_team} Win"] = outcome_probs[i]
+                        elif cls == 'D':
+                            probs_dict["Draw"] = outcome_probs[i]
+                        elif cls == 'A':
+                            probs_dict[f"{away_team} Win"] = outcome_probs[i]
+                    
+                    probs_series = pd.Series(probs_dict)
+                    st.bar_chart(probs_series)
+                    st.caption(f"**Confidence:** {max(outcome_probs):.1%}")
+                
+                # Feature importance
+                with st.expander("🔧 Advanced Features"):
+                    st.json({k: float(v) for k, v in fetched_stats.items() if isinstance(v, (int, float))})
         else:
-            st.info("No API data found or error occurred. Using current sidebar inputs for prediction.")
-
-    # Always use the values from st.session_state for processing
-    input_data = {'HomeTeam': home_team, 'AwayTeam': away_team}
-    input_data.update(st.session_state.feature_input_values)
-    input_df_raw = pd.DataFrame([input_data])
-
-    processed_features = preprocess_input_data(input_df_raw, feature_columns)
-
-    if processed_features is not None:
-        outcome_encoded = outcome_model.predict(processed_features)[0]
-        goals_pred = goals_model.predict(processed_features)[0]
-
-        outcome_probs = None
-        if hasattr(outcome_model, 'predict_proba'):
-            outcome_probs = outcome_model.predict_proba(processed_features)[0]
-
-        classes = getattr(label_encoder, 'classes_', outcome_model.classes_)
-        try:
-            predicted_outcome = label_encoder.inverse_transform([outcome_encoded])[0]
-        except:
-            predicted_outcome = classes[outcome_encoded]
-
-        outcome_display_map = {
-            'H': f"🏆 {home_team} Win",
-            'D': "🤝 Draw",
-            'A': f"🏆 {away_team} Win"
-        }
-        display_outcome = outcome_display_map.get(predicted_outcome, predicted_outcome)
-
-        st.subheader(f"📊 Prediction: **{home_team}** vs **{away_team}**")
-
-        col1, col2 = st.columns([1, 1.2])
-        with col1:
-            st.metric("**Predicted Outcome**", display_outcome)
-            st.metric("**Total Goals**", f"{round(goals_pred)}")
-            over_prob = "Likely **Over 2.5**" if goals_pred > 2.5 else "Likely **Under 2.5**"
-            st.metric("**Over/Under 2.5**", over_prob)
-
-        with col2:
-            if outcome_probs is not None:
-                probs_dict = {}
-                for i, cls in enumerate(classes):
-                    if cls == 'H':
-                        probs_dict[f"{home_team} Win"] = outcome_probs[i]
-                    elif cls == 'D':
-                        probs_dict["Draw"] = outcome_probs[i]
-                    elif cls == 'A':
-                        probs_dict[f"{away_team} Win"] = outcome_probs[i]
-                probs_series = pd.Series(probs_dict)
-                st.bar_chart(probs_series, width="stretch")
-                st.success(f"**Confidence:** {max(outcome_probs):.1%}")
-
-        st.caption("Computed Cluster Probabilities:")
-        cluster_values = processed_features[['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']].iloc[0]
-        st.dataframe(cluster_values.rename("Probability"), width="stretch")
-
-        st.caption("Model used: Gradient Boosting (outcome) + XGBoost (goals) with auto-computed clusters")
-
+            st.error("❌ Failed to fetch statistics. Please check team names and try again.")
 else:
-    st.info("👈 Fill in the statistics in the sidebar and click **Predict Match**.")
+    st.info("👈 Enter team names and click 'Fetch Live Statistics & Predict'")
 
-st.caption("✅ Auto cluster computation + clean config")
+# Footer
+st.markdown("---")
+st.caption("Data source: API-Football v3 | Model: Gradient Boosting + XGBoost")
