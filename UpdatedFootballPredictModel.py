@@ -275,13 +275,19 @@ input_config = {
 
 feature_input_values = {}
 for col, cfg in input_config.items():
+    # Generate a dynamic key for HomeElo and AwayElo to force update on team name change
+    if col in ['HomeElo', 'AwayElo']:
+        dynamic_key = f"{col}_{cfg['value']}"
+    else:
+        dynamic_key = col
+
     feature_input_values[col] = st.sidebar.number_input(
         label=cfg['label'],
         value=cfg['value'],
         step=cfg.get('step', 0.1),
         min_value=cfg.get('min', None),
         max_value=cfg.get('max', None),
-        key=col # Add a unique key for each widget
+        key=dynamic_key # Use the dynamic key here
     )
 
 if st.sidebar.button("🚀 Predict Match", type="primary", width="stretch"):
