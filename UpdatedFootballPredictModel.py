@@ -56,32 +56,58 @@ DEFAULTS = {
 CLUSTER_ZERO = {k: 0.0 for k in ['C_LTH', 'C_LTA', 'C_VHD', 'C_VAD', 'C_HTB', 'C_PHB']}
 
 # =============================================================================
-# ELO SCRAPING
+# FIXED ELO SCRAPING
 # =============================================================================
-@st.cache_data(show_spinner="Fetching ELO ratings...", ttl=3600)
+@st.cache_data(show_spinner="Fetching latest ELO ratings...", ttl=1800)  # Cache for 30 minutes
 def load_elo_ratings():
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Try today's ranking first
     try:
-        response = requests.get('http://api.clubelo.com/', timeout=10)
+        url = f"http://api.clubelo.com/{today}"
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         df_elo = pd.read_csv(io.StringIO(response.text))
         df_elo['Clean_Club'] = df_elo['Club'].astype(str).str.strip()
+        st.success("✅ ELO ratings loaded successfully from ClubElo (today)")
         return df_elo
     except Exception:
-        st.warning("Could not load ELO data. Using defaults.")
+        pass
+
+    # Fallback: Try yesterday
+    try:
+        yesterday = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        url = f"http://api.clubelo.com/{yesterday}"
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        df_elo = pd.read_csv(io.StringIO(response.text))
+        df_elo['Clean_Club'] = df_elo['Club'].astype(str).str.strip()
+        st.info("✅ ELO ratings loaded (yesterday's ranking)")
+        return df_elo
+    except Exception as e:
+        st.warning(f"Could not load ELO data from ClubElo API. Using default {DEFAULT_ELO} for all teams.")
         return pd.DataFrame(columns=['Club', 'Elo', 'Clean_Club'])
 
 def get_elo_for_team(team_name: str, df_elo: pd.DataFrame) -> tuple[float, str | None]:
     if df_elo.empty or not team_name.strip():
         return DEFAULT_ELO, None
+    
     name_lower = team_name.strip().lower()
+    # Flexible matching
     mask = df_elo['Clean_Club'].str.lower().str.contains(name_lower, na=False, regex=False)
     matches = df_elo[mask]
+
     if matches.empty:
         return DEFAULT_ELO, f'No ELO match for "{team_name}". Using default {DEFAULT_ELO}.'
+
+    # Prefer exact match
     exact = matches[matches['Clean_Club'].str.lower() == name_lower]
     if len(exact) == 1:
         return float(exact['Elo'].iloc[0]), None
-    return DEFAULT_ELO, f'"{team_name}" matched multiple teams. Using default.'
+
+    # Otherwise take the highest Elo among matches
+    best_match = matches.loc[matches['Elo'].idxmax()]
+    return float(best_match['Elo']), f'Using closest match for "{team_name}".'
 
 # =============================================================================
 # MODEL LOADING
@@ -107,7 +133,7 @@ def load_cluster_models():
         return None, None
 
 # =============================================================================
-# API-FOOTBALL FUNCTIONS
+# API-FOOTBALL HELPERS
 # =============================================================================
 def search_team(team_name: str, api_key: str):
     try:
@@ -142,9 +168,9 @@ def calculate_form(fixtures: list, team_id: int) -> tuple[int, int]:
     points = []
     for f in fixtures:
         if f["teams"]["home"]["id"] == team_id:
-            winner = f["teams"]["home"]["winner"]
+            winner = f["teams"]["home"].get("winner")
         else:
-            winner = f["teams"]["away"]["winner"]
+            winner = f["teams"]["away"].get("winner")
         points.append(3 if winner is True else 1 if winner is None else 0)
     points = points[-5:]
     return sum(points[-3:]), sum(points)
@@ -191,7 +217,6 @@ def create_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Form3Ratio'] = df['Form3Home'] / (df['Form3Away'] + 1e-5)
     df['Form5Ratio'] = df['Form5Home'] / (df['Form5Away'] + 1e-5)
 
-    # Normalized implied probabilities
     h = 1 / df['OddHome'].replace(0, 1)
     d = 1 / df['OddDraw'].replace(0, 1)
     a = 1 / df['OddAway'].replace(0, 1)
@@ -236,7 +261,6 @@ def init_session_state():
 # =============================================================================
 st.set_page_config(page_title="Football Match Predictor", page_icon="⚽", layout="wide")
 st.title("⚽ Football Match Predictor")
-st.markdown("Predict match outcomes using Gradient Boosting + XGBoost models with real stats from API-Football.")
 
 init_session_state()
 
@@ -248,24 +272,23 @@ if outcome_model is None or goals_model is None:
     st.error("Prediction models could not be loaded. Check file paths.")
     st.stop()
 
-# --------------------- Sidebar ---------------------
+# Sidebar
 st.sidebar.header("Configuration")
-
 api_key = st.sidebar.text_input(
     "🔑 API-Football API Key",
     type="password",
-    help="Get your free key at https://www.api-football.com/ (100 requests/day on free plan)"
+    help="Get free key at https://www.api-football.com/"
 )
 
 st.sidebar.divider()
 
-col_team1, col_team2 = st.columns(2)
-with col_team1:
+col1, col2 = st.columns(2)
+with col1:
     home_team = st.text_input("Home Team", "Arsenal")
-with col_team2:
+with col2:
     away_team = st.text_input("Away Team", "Chelsea")
 
-# ELO
+# ELO with warnings
 home_elo_scraped, home_warn = get_elo_for_team(home_team, df_elo)
 away_elo_scraped, away_warn = get_elo_for_team(away_team, df_elo)
 
@@ -274,7 +297,7 @@ if home_warn:
 if away_warn:
     st.warning(f"🏟️ {away_warn}")
 
-# Sync ELO when teams change
+# Sync when team names change
 if 'prev_home' not in st.session_state or st.session_state.prev_home != home_team:
     st.session_state.inputs['HomeElo'] = home_elo_scraped
     st.session_state.prev_home = home_team
@@ -285,16 +308,16 @@ if 'prev_away' not in st.session_state or st.session_state.prev_away != away_tea
     st.session_state.prev_away = away_team
     st.session_state.stats_fetched = False
 
-# Fetch Button
+# Fetch Stats Button
 if st.button("🔍 Fetch Stats from API-Football", type="secondary", use_container_width=True, disabled=not api_key):
     if not api_key:
-        st.error("Please enter your API-Football key in the sidebar.")
+        st.error("Please enter your API-Football key.")
     else:
         home_info = search_team(home_team, api_key)
         away_info = search_team(away_team, api_key)
 
         if not home_info or not away_info:
-            st.error("Could not find one or both teams. Try more precise names.")
+            st.error("Could not find one or both teams. Try more accurate names.")
         else:
             home_id = home_info["id"]
             away_id = away_info["id"]
@@ -305,13 +328,12 @@ if st.button("🔍 Fetch Stats from API-Football", type="secondary", use_contain
             form3_home, form5_home = calculate_form(home_fixtures, home_id)
             form3_away, form5_away = calculate_form(away_fixtures, away_id)
 
-            # Update session state inputs
             st.session_state.inputs.update({
-                'HomeShots': 12.0,          # Free tier has limited detailed stats
+                'HomeShots': 12.0,
                 'AwayShots': 10.0,
                 'HomeTarget': 4.0,
                 'AwayTarget': 3.0,
-                'HomeExpectedGoals': 1.5,   # xG is very limited on free tier
+                'HomeExpectedGoals': 1.5,
                 'AwayExpectedGoals': 1.2,
                 'Form3Home': form3_home,
                 'Form5Home': form5_home,
@@ -326,13 +348,13 @@ if st.button("🔍 Fetch Stats from API-Football", type="secondary", use_contain
             })
 
             st.session_state.stats_fetched = True
-            st.session_state.fetch_notes = "Stats fetched via API-Football. Form calculated from recent fixtures. Shots & xG use defaults (limited on free tier)."
+            st.session_state.fetch_notes = "✅ Form calculated from recent fixtures via API-Football. Shots & xG are defaults (detailed stats limited on free tier)."
             st.rerun()
 
 if st.session_state.get('fetch_notes'):
     st.caption(f"📰 {st.session_state.fetch_notes}")
 
-# --------------------- Sidebar Inputs ---------------------
+# Sidebar Match Parameters
 st.sidebar.header("Match Parameters")
 
 with st.sidebar.expander("📊 ELO Ratings", expanded=True):
