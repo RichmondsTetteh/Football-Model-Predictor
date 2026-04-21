@@ -385,6 +385,11 @@ st.markdown(
     "Click **Analyze Teams** to load form and shot stats from historical data, "
     "then hit **Predict Match** in the sidebar."
 )
+st.info(
+    "⏳ **First-time tip:** The first click on **Analyze Teams** may take a while — the app needs to "
+    "download a large number of match files from football-data.co.uk. Once complete, the data stays "
+    "cached so all subsequent analyses for any team pair will be much faster."
+)
 
 # Load resources
 df_elo = load_elo_ratings()
@@ -410,16 +415,22 @@ if home_warn:
 if away_warn:
     st.warning(f"🏟️ {away_warn}")
 
-# Auto-update ELO when team names change
+# Auto-update ELO when team names change and flag that re-analysis is needed
+teams_changed = False
+
 if 'prev_home' not in st.session_state or st.session_state.prev_home != home_team:
     st.session_state.inputs['HomeElo'] = home_elo_scraped
     st.session_state.prev_home = home_team
-    st.session_state.fd_analysis_done = False
+    if st.session_state.fd_analysis_done:
+        st.session_state.fd_analysis_done = False
+        teams_changed = True
 
 if 'prev_away' not in st.session_state or st.session_state.prev_away != away_team:
     st.session_state.inputs['AwayElo'] = away_elo_scraped
     st.session_state.prev_away = away_team
-    st.session_state.fd_analysis_done = False
+    if st.session_state.fd_analysis_done:
+        st.session_state.fd_analysis_done = False
+        teams_changed = True
 
 # ── Analyze button ────────────────────────────────────────────────────────────
 btn_col, status_col = st.columns([2, 3])
@@ -433,7 +444,9 @@ with btn_col:
     )
 
 with status_col:
-    if st.session_state.fd_analysis_done:
+    if teams_changed:
+        st.warning("⚠️ Team names changed — click **Analyze Teams** to refresh stats.")
+    elif st.session_state.fd_analysis_done:
         st.success("✅ Historical stats loaded — inputs updated. Ready to predict.")
 
 # ── Historical data analysis ──────────────────────────────────────────────────
