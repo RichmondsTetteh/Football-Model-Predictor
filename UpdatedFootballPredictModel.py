@@ -11,7 +11,6 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urljoin
-from sklearn.preprocessing import LabelEncoder
 from scipy.special import softmax
 
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
@@ -28,15 +27,6 @@ CLUSTER_SCALER_FILENAME = os.path.join(BASE_DIR, 'cluster_robust_scaler.joblib')
 CLUSTER_KMEANS_FILENAME = os.path.join(BASE_DIR, 'cluster_kmeans_model.joblib')
 
 DEFAULT_ELO = 1500.0
-API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
-
-LEAGUES = {
-    "Premier League (England)": 39,
-    "La Liga (Spain)": 140,
-    "Bundesliga (Germany)": 78,
-    "Serie A (Italy)": 135,
-    "Ligue 1 (France)": 61,
-}
 
 DEFAULTS = {
     'HomeShots': 12.0,
@@ -188,7 +178,7 @@ def download_and_merge_football_data():
 
 
 # =============================================================================
-# FORM & STATS HELPERS (from first app)
+# FORM & STATS HELPERS
 # =============================================================================
 def calculate_team_form(team_name, df_data, num_matches):
     team_matches = df_data[(df_data['HomeTeam'] == team_name) | (df_data['AwayTeam'] == team_name)].copy()
@@ -309,112 +299,6 @@ def load_cluster_models():
 
 
 # =============================================================================
-# API-FOOTBALL HELPERS
-# =============================================================================
-def _api_headers(api_key):
-    return {"x-apisports-key": api_key}
-
-
-def search_team(team_name, api_key):
-    try:
-        resp = requests.get(f"{API_FOOTBALL_BASE}/teams", headers=_api_headers(api_key),
-                            params={"search": team_name}, timeout=12)
-        resp.raise_for_status()
-        results = resp.json().get("response", [])
-        if results:
-            return results[0]["team"]
-    except Exception as e:
-        st.warning(f"Team search failed for '{team_name}': {e}")
-    return None
-
-
-def fetch_team_statistics(team_id, league_id, api_key):
-    current_year = datetime.now().year
-    for season in [current_year, current_year - 1]:
-        try:
-            resp = requests.get(f"{API_FOOTBALL_BASE}/teams/statistics",
-                                headers=_api_headers(api_key),
-                                params={"league": league_id, "team": team_id, "season": season},
-                                timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
-            response_data = payload.get("response")
-            if response_data and isinstance(response_data, dict):
-                return response_data
-        except Exception:
-            continue
-    return None
-
-
-def parse_form_string(form_string):
-    if not form_string:
-        return 0, 0
-    pts = {'W': 3, 'D': 1, 'L': 0}
-    recent = [pts.get(c, 0) for c in form_string.strip()]
-    form3 = sum(recent[-3:]) if len(recent) >= 3 else sum(recent)
-    form5 = sum(recent[-5:]) if len(recent) >= 5 else sum(recent)
-    return form3, form5
-
-
-def extract_avg_goals_scored(stats, venue="total"):
-    try:
-        raw = stats["goals"]["for"]["average"][venue]
-        return float(raw) if raw is not None else 1.5
-    except Exception:
-        return 1.5
-
-
-def extract_avg_goals_conceded(stats, venue="total"):
-    try:
-        raw = stats["goals"]["against"]["average"][venue]
-        return float(raw) if raw is not None else 1.2
-    except Exception:
-        return 1.2
-
-
-def estimate_shots_from_goals(avg_goals):
-    avg_shots = max(5.0, min(round(avg_goals / 0.10, 1), 28.0))
-    avg_shots_target = max(2.0, min(round(avg_goals / 0.35, 1), 14.0))
-    return avg_shots, avg_shots_target
-
-
-def estimate_over25_odd(stats):
-    try:
-        over_count = stats["goals"]["for"]["under_over"]["2.5"]["over"]
-        total_played = stats["fixtures"]["played"]["total"]
-        if over_count is None or not total_played:
-            return 2.0
-        rate = over_count / total_played
-        odd = round(1.0 / rate, 2) if rate > 0 else 2.0
-        return max(1.10, min(odd, 4.00))
-    except Exception:
-        return 2.0
-
-
-def build_fetched_inputs(home_stats, away_stats):
-    form3_home, form5_home = parse_form_string(home_stats.get("form", ""))
-    form3_away, form5_away = parse_form_string(away_stats.get("form", ""))
-    xg_home = extract_avg_goals_scored(home_stats, venue="home")
-    xg_away = extract_avg_goals_scored(away_stats, venue="away")
-    home_shots, home_target = estimate_shots_from_goals(xg_home)
-    away_shots, away_target = estimate_shots_from_goals(xg_away)
-    home_o25_odd = estimate_over25_odd(home_stats)
-    away_o25_odd = estimate_over25_odd(away_stats)
-    combined_over_odd = round((home_o25_odd + away_o25_odd) / 2, 2)
-    combined_under_odd = max(1.10, min(round(3.6 / combined_over_odd, 2), 4.00))
-    return {
-        'Form3Home': form3_home, 'Form5Home': form5_home,
-        'Form3Away': form3_away, 'Form5Away': form5_away,
-        'HomeExpectedGoals': round(xg_home, 2), 'AwayExpectedGoals': round(xg_away, 2),
-        'HomeShots': home_shots, 'AwayShots': away_shots,
-        'HomeTarget': home_target, 'AwayTarget': away_target,
-        'Over25': combined_over_odd, 'Under25': combined_under_odd,
-        'OddHome': DEFAULTS['OddHome'], 'OddDraw': DEFAULTS['OddDraw'],
-        'OddAway': DEFAULTS['OddAway'], 'HandiSize': DEFAULTS['HandiSize'],
-    }
-
-
-# =============================================================================
 # FEATURE ENGINEERING
 # =============================================================================
 def clean_input_data(df):
@@ -486,10 +370,6 @@ def preprocess_input(raw_row, scaler, kmeans):
 # =============================================================================
 if 'inputs' not in st.session_state:
     st.session_state.inputs = {**DEFAULTS, 'HomeElo': DEFAULT_ELO, 'AwayElo': DEFAULT_ELO}
-if 'stats_fetched' not in st.session_state:
-    st.session_state.stats_fetched = False
-if 'fetch_notes' not in st.session_state:
-    st.session_state.fetch_notes = ""
 if 'fd_analysis_done' not in st.session_state:
     st.session_state.fd_analysis_done = False
 if 'fd_results' not in st.session_state:
@@ -502,8 +382,8 @@ st.set_page_config(page_title="Football Match Predictor", page_icon="⚽", layou
 st.title("⚽ Football Match Predictor")
 st.markdown(
     "Predict match outcomes and total goals using Gradient Boosting + XGBoost. "
-    "**Analyze Teams** below to auto-fill form and shot stats from historical data, "
-    "or use **Fetch Stats** to pull from API-Football."
+    "Click **Analyze Teams** to load form and shot stats from historical data, "
+    "then hit **Predict Match** in the sidebar."
 )
 
 # Load resources
@@ -514,16 +394,6 @@ cluster_scaler, kmeans_model = load_cluster_models()
 if outcome_model is None or goals_model is None:
     st.error("Prediction models could not be loaded. Check file paths.")
     st.stop()
-
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-st.sidebar.header("Configuration")
-api_key = st.sidebar.text_input(
-    "🔑 API-Football Key", type="password",
-    help="Free key at https://www.api-football.com/ — required only for stat fetching.",
-)
-selected_league = st.sidebar.selectbox("League", options=list(LEAGUES.keys()))
-league_id = LEAGUES[selected_league]
-st.sidebar.divider()
 
 # ── Team name inputs ──────────────────────────────────────────────────────────
 col1, col2 = st.columns(2)
@@ -540,45 +410,31 @@ if home_warn:
 if away_warn:
     st.warning(f"🏟️ {away_warn}")
 
+# Auto-update ELO when team names change
 if 'prev_home' not in st.session_state or st.session_state.prev_home != home_team:
     st.session_state.inputs['HomeElo'] = home_elo_scraped
     st.session_state.prev_home = home_team
-    st.session_state.stats_fetched = False
     st.session_state.fd_analysis_done = False
 
 if 'prev_away' not in st.session_state or st.session_state.prev_away != away_team:
     st.session_state.inputs['AwayElo'] = away_elo_scraped
     st.session_state.prev_away = away_team
-    st.session_state.stats_fetched = False
     st.session_state.fd_analysis_done = False
 
-# ── Action buttons row ────────────────────────────────────────────────────────
-btn_col1, btn_col2, btn_col3 = st.columns([2, 2, 3])
+# ── Analyze button ────────────────────────────────────────────────────────────
+btn_col, status_col = st.columns([2, 3])
 
-with btn_col1:
+with btn_col:
     analyze_clicked = st.button(
-        "📊 Analyze Teams (Historical Data)",
+        "📊 Analyze Teams",
         type="primary",
         use_container_width=True,
-        help="Loads data from football-data.co.uk and calculates form + shot stats"
+        help="Loads historical data from football-data.co.uk and calculates form + shot stats",
     )
 
-with btn_col2:
-    fetch_clicked = st.button(
-        "🔍 Fetch Stats (API-Football)",
-        type="secondary",
-        use_container_width=True,
-        disabled=not bool(api_key),
-        help="Pulls form, xG and shot estimates from API-Football." if api_key else "Enter API key in sidebar.",
-    )
-
-with btn_col3:
-    if st.session_state.stats_fetched:
-        st.success("✅ API stats fetched — review sidebar values before predicting.")
-    elif st.session_state.fd_analysis_done:
+with status_col:
+    if st.session_state.fd_analysis_done:
         st.success("✅ Historical stats loaded — inputs updated. Ready to predict.")
-    elif not api_key:
-        st.info("💡 Add your API-Football key in the sidebar to enable stat fetching.")
 
 # ── Historical data analysis ──────────────────────────────────────────────────
 if analyze_clicked:
@@ -588,13 +444,11 @@ if analyze_clicked:
     if df_full.empty:
         st.error("Could not load football data. Check internet connection or data source.")
     else:
-        # Calculate form
         pts3_home, form3_str_home, matches3_home = calculate_team_form(home_team, df_full, 3)
         pts5_home, form5_str_home, matches5_home = calculate_team_form(home_team, df_full, 5)
         pts3_away, form3_str_away, matches3_away = calculate_team_form(away_team, df_full, 3)
         pts5_away, form5_str_away, matches5_away = calculate_team_form(away_team, df_full, 5)
 
-        # Calculate weighted shot stats
         stats5_home = calculate_average_stats(home_team, matches5_home)
         stats5_away = calculate_average_stats(away_team, matches5_away)
         season_stats_home = calculate_season_average_stats(home_team, df_full)
@@ -610,7 +464,6 @@ if analyze_clicked:
             for k in stats5_away
         }
 
-        # Store results for display
         st.session_state.fd_results = {
             'home_team': home_team, 'away_team': away_team,
             'pts3_home': pts3_home, 'form3_str_home': form3_str_home, 'matches3_home': matches3_home,
@@ -621,8 +474,6 @@ if analyze_clicked:
         }
         st.session_state.fd_analysis_done = True
 
-        # Auto-populate prediction inputs from historical data
-        # xG estimated from shots on target (shots on target / 3 ≈ goals)
         home_xg_est = round(weighted_home['Shots On Target For'] / 3.0, 2)
         away_xg_est = round(weighted_away['Shots On Target For'] / 3.0, 2)
 
@@ -638,7 +489,6 @@ if analyze_clicked:
             'HomeExpectedGoals': max(0.1, home_xg_est),
             'AwayExpectedGoals': max(0.1, away_xg_est),
         })
-        st.session_state.stats_fetched = False
 
         st.rerun()
 
@@ -688,39 +538,9 @@ if st.session_state.fd_analysis_done and st.session_state.fd_results:
                 st.write(f"- {k}: **{v:.2f}**")
 
         st.info(
-            "✅ Form points and shot stats from historical data have been automatically applied "
-            "to the prediction inputs in the sidebar. Review and adjust as needed, then click **Predict Match**."
+            "✅ Form points and shot stats have been automatically applied to the prediction inputs "
+            "in the sidebar. Review and adjust as needed, then click **Predict Match**."
         )
-
-# ── API-Football fetch ────────────────────────────────────────────────────────
-if fetch_clicked and api_key:
-    with st.spinner(f"Fetching stats for {home_team} and {away_team}…"):
-        home_info = search_team(home_team, api_key)
-        away_info = search_team(away_team, api_key)
-        if not home_info or not away_info:
-            st.error("Could not find one or both teams. Try the full official name.")
-        else:
-            home_stats = fetch_team_statistics(home_info["id"], league_id, api_key)
-            away_stats = fetch_team_statistics(away_info["id"], league_id, api_key)
-            if home_stats and away_stats:
-                new_inputs = build_fetched_inputs(home_stats, away_stats)
-                st.session_state.inputs.update(new_inputs)
-                st.session_state.stats_fetched = True
-                form_len = len(home_stats.get("form", ""))
-                st.session_state.fetch_notes = (
-                    f"Data from {selected_league} via API-Football "
-                    f"({home_info['name']} vs {away_info['name']}). "
-                    f"Form from last {form_len} recorded matches. "
-                    f"xG = venue-split avg goals scored. "
-                    f"Shots estimated from scoring rate. "
-                    f"Betting odds not supplied — update manually."
-                )
-                st.rerun()
-            else:
-                st.warning("Team(s) found but no statistics returned. Check league and season selection.")
-
-if st.session_state.get('fetch_notes'):
-    st.caption(f"📰 {st.session_state.fetch_notes}")
 
 # ── Sidebar parameter inputs ──────────────────────────────────────────────────
 st.sidebar.header("Match Parameters")
@@ -755,7 +575,6 @@ with st.sidebar.expander("🔫 Team Statistics", expanded=False):
     })
 
 with st.sidebar.expander("💰 Betting Odds", expanded=False):
-    st.caption("Not supplied by API-Football — enter manually or leave as defaults.")
     odd_home = st.number_input("Home Win Odds", 1.01, value=float(st.session_state.inputs['OddHome']), step=0.05)
     odd_draw = st.number_input("Draw Odds", 1.01, value=float(st.session_state.inputs['OddDraw']), step=0.05)
     odd_away = st.number_input("Away Win Odds", 1.01, value=float(st.session_state.inputs['OddAway']), step=0.05)
@@ -769,8 +588,6 @@ with st.sidebar.expander("💰 Betting Odds", expanded=False):
 
 if st.sidebar.button("🔄 Reset to Defaults", use_container_width=True):
     st.session_state.inputs = {**DEFAULTS, 'HomeElo': home_elo_scraped, 'AwayElo': away_elo_scraped}
-    st.session_state.stats_fetched = False
-    st.session_state.fetch_notes = ""
     st.session_state.fd_analysis_done = False
     st.session_state.fd_results = {}
     st.rerun()
@@ -814,14 +631,8 @@ if predict_clicked:
 
         st.markdown("---")
         st.subheader(f"📊 Prediction: **{home_team}** vs **{away_team}**")
-
-        data_source = ""
-        if st.session_state.stats_fetched:
-            data_source = "ℹ️ Stats sourced from API-Football."
-        elif st.session_state.fd_analysis_done:
-            data_source = "ℹ️ Stats sourced from football-data.co.uk historical data."
-        if data_source:
-            st.caption(data_source)
+        if st.session_state.fd_analysis_done:
+            st.caption("ℹ️ Stats sourced from football-data.co.uk historical data.")
 
         col1, col2 = st.columns([1, 1.2])
         with col1:
@@ -855,5 +666,5 @@ if predict_clicked:
         st.caption("Models: Gradient Boosting (outcome) + XGBoost (goals)")
 
 else:
-    if not st.session_state.fd_analysis_done and not st.session_state.stats_fetched:
-        st.info("👈 Click **Analyze Teams** to load historical stats, or **Fetch Stats** for API data. Then click **Predict Match** in the sidebar.")
+    if not st.session_state.fd_analysis_done:
+        st.info("👈 Click **Analyze Teams** to load historical stats, then click **Predict Match** in the sidebar.")
